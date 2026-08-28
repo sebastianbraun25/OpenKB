@@ -246,13 +246,6 @@ _TYPE_DISPLAY_MAP = {
     "pageindex_cloud": "pageindex",
 }
 
-# Outcome of a single-document add/import. "added_partial" means the document
-# was ingested and every concept/entity that *did* generate was written, but
-# one or more planned concept/entity updates were unrecoverable (even after
-# the in-process retry sweep in ``_compile_concepts``) — the source hash is
-# intentionally left unregistered so the file is retried, not silently lost.
-AddStatus = Literal["added", "added_partial", "skipped", "failed"]
-
 # Registry types that were compiled via the long-doc pipeline (tree + per-page
 # JSON source), as opposed to short docs (markdown source). Both the local
 # long-PDF type and cloud imports belong here — they share the long-doc
@@ -435,25 +428,12 @@ def _snapshot_add_paths(
     return paths
 
 
-def _run_compile_with_retry(coro_factory, label: str) -> bool:
-    """Run a compile coroutine factory, retrying once on a hard exception.
-
-    Returns the compile coroutine's own bool result (``True`` = every planned
-    concept/entity update was written, ``False`` = partial — see
-    ``compile_short_doc``/``compile_long_doc``). A ``None`` result (e.g. from
-    a test double that predates this contract) is treated as full success,
-    matching the old implicit "no exception raised = done" behavior. This is
-    orthogonal to the retry-on-exception loop below: a *raised* exception
-    here means the whole compile step blew up (plan call failed, etc.) and is
-    retried wholesale; a ``False`` return means the compile finished but some
-    individual concept/entity generations were unrecoverable even after their
-    own in-process retry sweep.
-    """
+def _run_compile_with_retry(coro_factory, label: str) -> None:
     click.echo(f"  {label}...")
     for attempt in range(2):
         try:
-            result = asyncio.run(coro_factory())
-            return True if result is None else bool(result)
+            asyncio.run(coro_factory())
+            return
         except Exception as exc:
             if attempt == 0:
                 click.echo("  Retrying compilation in 2s...")
@@ -462,27 +442,27 @@ def _run_compile_with_retry(coro_factory, label: str) -> bool:
                 click.echo(f"  [ERROR] Compilation failed: {exc}")
                 logger.debug("Compilation traceback:", exc_info=True)
                 raise
-    return False  # pragma: no cover - unreachable (loop always returns or raises)
 
 
-def add_single_file(file_path: Path, kb_dir: Path, *, stage: bool = True, bundle=None) -> AddStatus:
+def add_single_file(
+    file_path: Path, kb_dir: Path, *, stage: bool = True, bundle=None
+) -> Literal["added", "skipped", "failed"]:
     """Convert, index, and compile a single document under the KB mutation lock."""
     with kb_ingest_lock(kb_dir / ".openkb"):
         return _add_single_file_locked(file_path, kb_dir, stage=stage, bundle=bundle)
 
 
-def _delete_if_auto_cleanup_enabled(file_path: Path, status: AddStatus, config: dict) -> bool:
+def _delete_if_auto_cleanup_enabled(
+    file_path: Path, status: Literal["added", "skipped", "failed"], config: dict
+) -> bool:
     """Delete file if auto_delete_added_files is enabled and ingestion succeeded/skipped.
 
     Deletes on both "added" (successful ingestion) and "skipped" (duplicate already
-    in KB) to keep raw/ directory clean. Preserves files on "failed" — and on
-    "added_partial", where one or more planned concept/entity updates are still
-    missing — so the user (or the next `openkb add` run) can retry.
+    in KB) to keep raw/ directory clean. Preserves files on "failed" to allow retries.
 
     Args:
         file_path: Path to the file to potentially delete.
-        status: Result status from add_single_file ("added", "added_partial",
-            "skipped", or "failed").
+        status: Result status from add_single_file ("added", "skipped", or "failed").
         config: Configuration dict (typically from resolve_effective_config).
 
     Returns:
@@ -500,7 +480,7 @@ def _delete_if_auto_cleanup_enabled(file_path: Path, status: AddStatus, config: 
 
 def _add_single_file_locked(
     file_path: Path, kb_dir: Path, *, stage: bool = True, bundle=None
-) -> AddStatus:
+) -> Literal["added", "skipped", "failed"]:
     """Convert, index, and compile a single document into the knowledge base.
 
     Steps:
@@ -510,14 +490,12 @@ def _add_single_file_locked(
     4. Else: compile_short_doc.
 
     Returns:
-        ``"added"`` on full success, ``"added_partial"`` when the document was
-        ingested but one or more planned concept/entity updates are still
-        missing (hash intentionally left unregistered so a re-add retries
-        them), ``"skipped"`` when the file's hash is already in the registry
-        (dedup), or ``"failed"`` when any pipeline stage raised. URL-ingest
-        distinguishes these so it can unlink the just-downloaded raw file on
-        dedup (it would otherwise be an orphan) while preserving it on
-        failure/partial success so the user can retry without re-downloading.
+        ``"added"`` on full success, ``"skipped"`` when the file's hash
+        is already in the registry (dedup), or ``"failed"`` when any
+        pipeline stage raised. URL-ingest distinguishes these so it can
+        unlink the just-downloaded raw file on dedup (it would otherwise
+        be an orphan) while preserving it on failure so the user can
+        retry without re-downloading.
     """
     from openkb.agent.compiler import compile_long_doc, compile_short_doc
     from openkb.state import HashRegistry
@@ -549,12 +527,11 @@ def _add_single_file_locked(
 
     doc_name = result.doc_name or file_path.stem
     index_result = None  # populated only on the long-doc branch
-    compile_ok = True  # False if any planned concept/entity update is missing
 
     final_raw, final_source = _final_artifact_paths(result, kb_dir)
 
     def commit_body(snapshot) -> None:
-        nonlocal index_result, compile_ok
+        nonlocal index_result
         publish_staged_tree(staging_dir, kb_dir)
         if final_raw is not None:
             result.raw_path = final_raw
@@ -599,7 +576,7 @@ def _add_single_file_locked(
                 )
 
             summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
-            compile_ok = _run_compile_with_retry(
+            _run_compile_with_retry(
                 lambda: compile_long_doc(
                     doc_name,
                     summary_path,
@@ -616,7 +593,7 @@ def _add_single_file_locked(
             if result.source_path is None:
                 raise RuntimeError(f"Converted document has no source artifact: {file_path.name}")
             source_path = result.source_path
-            compile_ok = _run_compile_with_retry(
+            _run_compile_with_retry(
                 lambda: compile_short_doc(
                     doc_name,
                     source_path,
@@ -628,12 +605,8 @@ def _add_single_file_locked(
                 label="Compiling short doc",
             )
 
-        # Register hash only after a fully successful compile. A partial
-        # compile (some planned concept/entity update still missing after
-        # the in-process retry sweep) intentionally leaves the hash
-        # unregistered so the next `openkb add` of this file is treated as
-        # new — not a duplicate to skip — and retries the missing pieces.
-        if compile_ok and result.file_hash:
+        # Register hash only after successful compilation.
+        if result.file_hash:
             registry = HashRegistry(openkb_dir / "hashes.json")
             doc_type = "long_pdf" if result.is_long_doc else file_path.suffix.lstrip(".")
             meta = {
@@ -681,15 +654,8 @@ def _add_single_file_locked(
     )
     if not run_add_mutation(kb_dir, plan):
         return "failed"
-    if compile_ok:
-        click.echo(f"  [OK] {file_path.name} added to knowledge base.")
-        return "added"
-    click.echo(
-        f"  [WARN] {file_path.name} added with some concept/entity updates missing "
-        "(see warnings above). Hash not registered — the next `openkb add` run will "
-        "retry the missing pieces."
-    )
-    return "added_partial"
+    click.echo(f"  [OK] {file_path.name} added to knowledge base.")
+    return "added"
 
 
 @dataclass
@@ -721,16 +687,11 @@ def _add_for_api(file_path: Path, kb_dir: Path, *, bundle=None) -> AddFileResult
         message = f"Already in knowledge base: {file_path.name}"
     elif status_str == "failed":
         message = f"Failed to add: {file_path.name} (see server logs)"
-    elif status_str == "added_partial":
-        message = (
-            f"Added with some concept/entity updates missing: {file_path.name} "
-            "(will be retried on the next add)"
-        )
     else:
         message = f"Added: {file_path.name}"
     return AddFileResult(
         original_name=file_path.name,
-        saved_path=str(file_path) if status_str in ("added", "added_partial") else None,
+        saved_path=str(file_path) if status_str == "added" else None,
         status=status_str,
         message=message,
     )
@@ -768,7 +729,7 @@ def _cleanup_failed_cloud_import(kb_dir: Path, doc_name: str) -> None:
     )
 
 
-def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> AddStatus:
+def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> Literal["added", "skipped", "failed"]:
     """Import an existing PageIndex Cloud document into the KB by ``doc_id``.
 
     Fetches structure + page content from the cloud (no local PDF), compiles
@@ -814,10 +775,8 @@ def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> AddStatus:
 
             stem = _cloud_display_stem(cloud.cloud_name, doc_id)
             doc_name = resolve_doc_name_from_key(stem, path_key, registry)
-            compile_ok = True  # False if any planned concept/entity update is missing
 
             def commit_body(_snapshot) -> None:
-                nonlocal compile_ok
                 summary_path = _write_long_doc_artifacts(
                     cloud.tree,
                     cloud.all_pages,
@@ -826,7 +785,7 @@ def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> AddStatus:
                     kb_dir,
                     description=cloud.description,
                 )
-                compile_ok = _run_compile_with_retry(
+                _run_compile_with_retry(
                     lambda: compile_long_doc(
                         doc_name,
                         summary_path,
@@ -839,14 +798,7 @@ def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> AddStatus:
                     label=f"Compiling imported doc (doc_id={doc_id})",
                 )
 
-                # Register the raw-less cloud entry only after a fully successful
-                # compile. There is no raw file fallback for a cloud import (the
-                # doc_id is deterministic), so registering on a partial compile
-                # would permanently mask the missing concept/entity updates —
-                # re-importing the same doc_id would just be treated as a dup
-                # and skipped forever.
-                if not compile_ok:
-                    return
+                # Register the raw-less cloud entry only after successful compilation.
                 registry = HashRegistry(openkb_dir / "hashes.json")
                 meta = {
                     "name": cloud.cloud_name,
@@ -890,14 +842,8 @@ def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> AddStatus:
         logger.debug("Cloud import mutation traceback:", exc_info=True)
         return "failed"
 
-    if compile_ok:
-        click.echo(f"  [OK] {doc_name} imported from PageIndex Cloud.")
-        return "added"
-    click.echo(
-        f"  [WARN] {doc_name} imported with some concept/entity updates missing "
-        "(see warnings above); hash not registered so re-running the import will retry them."
-    )
-    return "added_partial"
+    click.echo(f"  [OK] {doc_name} imported from PageIndex Cloud.")
+    return "added"
 
 
 # ---------------------------------------------------------------------------
@@ -1255,7 +1201,7 @@ def add_all(ctx):
     is enabled in config.yaml, files are automatically deleted after ingestion
     (both on successful addition and on skip/duplicate).
 
-    Returns a summary of the operation (added, partial, skipped, failed, deleted counts).
+    Returns a summary of the operation (added, skipped, failed, deleted counts).
     """
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
@@ -1278,7 +1224,7 @@ def add_all(ctx):
 
     config = resolve_effective_config(kb_dir)[0]
     total = len(files)
-    added = partial = skipped = failed = deleted = 0
+    added = skipped = failed = deleted = 0
 
     click.echo(f"Processing {total} file(s) from raw/ directory...")
     for i, f in enumerate(files, 1):
@@ -1286,8 +1232,6 @@ def add_all(ctx):
         outcome = add_single_file(f, kb_dir)
         if outcome == "added":
             added += 1
-        elif outcome == "added_partial":
-            partial += 1
         elif outcome == "skipped":
             skipped += 1
         else:
@@ -1296,8 +1240,7 @@ def add_all(ctx):
             deleted += 1
 
     click.echo(
-        f"\n\nSummary: Added: {added}, Partial: {partial}, Skipped: {skipped}, "
-        f"Failed: {failed}, Deleted: {deleted}"
+        f"\n\nSummary: Added: {added}, Skipped: {skipped}, Failed: {failed}, Deleted: {deleted}"
     )
 
 

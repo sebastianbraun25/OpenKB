@@ -277,7 +277,6 @@ def _summarize_add_results(kb: str, results: list[AddFileItem]) -> AddResponse:
         kb=kb,
         files=results,
         added_count=sum(1 for item in results if item.status == "added"),
-        added_partial_count=sum(1 for item in results if item.status == "added_partial"),
         skipped_count=sum(1 for item in results if item.status == "skipped"),
         failed_count=sum(1 for item in results if item.status == "failed"),
     )

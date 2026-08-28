@@ -625,7 +625,6 @@ def test_add_endpoint_uploads_and_adds_multiple_files(monkeypatch, kb_dir):
             },
         ],
         "added_count": 1,
-        "added_partial_count": 0,
         "skipped_count": 1,
         "failed_count": 0,
     }
