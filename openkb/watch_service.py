@@ -143,7 +143,11 @@ def _process_file(state: WatcherState, raw_path: str) -> None:
         )
         _inc(state, "failed")
         return
-    status = result.status if result.status in ("added", "skipped", "failed") else "failed"
+    status = (
+        result.status
+        if result.status in ("added", "added_partial", "skipped", "failed")
+        else "failed"
+    )
     _record_event(
         state,
         "file_done",
