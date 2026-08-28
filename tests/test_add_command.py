@@ -372,6 +372,53 @@ class TestAddCommand:
         assert "path" in meta
         assert "stale-old-hash" not in hashes
 
+    def test_add_short_doc_partial_compile_skips_hash_and_keeps_file(self, tmp_path):
+        """When compile_short_doc reports an incomplete compile (some planned
+        concept/entity update was still missing after its own retry sweep),
+        the CLI must not register the hash or delete the raw file — so a
+        subsequent `openkb add` of the same file retries the missing pieces
+        instead of silently losing them."""
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text(
+            "model: gpt-4o-mini\nauto_delete_added_files: true\n"
+        )
+        doc = tmp_path / "test.md"
+        doc.write_text("# Hello")
+
+        source_path = kb_dir / "wiki" / "sources" / "test.md"
+        source_path.write_text("# Hello converted")
+
+        from openkb.converter import ConvertResult
+
+        mock_result = ConvertResult(
+            raw_path=kb_dir / "raw" / "test.md",
+            source_path=source_path,
+            is_long_doc=False,
+            file_hash="deadbeef00" * 8,
+            doc_name="test",
+        )
+
+        async def compile_partial(*args, **kwargs):
+            return False  # simulates an unrecovered concept/entity failure
+
+        runner = CliRunner()
+        with (
+            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
+            patch("openkb.cli.convert_document", return_value=mock_result),
+            patch("openkb.agent.compiler.compile_short_doc", new=compile_partial),
+        ):
+            result = runner.invoke(cli, ["add", str(doc)])
+
+        assert "WARN" in result.output
+        assert doc.exists(), "raw file must be kept (not auto-deleted) on a partial compile"
+
+        import json as json_mod
+
+        hashes = json_mod.loads((kb_dir / ".openkb" / "hashes.json").read_text(encoding="utf-8"))
+        assert mock_result.file_hash not in hashes, (
+            "hash must stay unregistered on a partial compile so a re-add retries it"
+        )
+
     def test_add_oldest_legacy_entry_converges_to_single_entry(self, tmp_path):
         """Editing a pre-doc_name-era document must not fork the registry.
 

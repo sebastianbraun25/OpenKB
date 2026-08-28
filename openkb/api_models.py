@@ -118,6 +118,7 @@ class AddResponse(BaseModel):
     kb: str
     files: list[AddFileItem]
     added_count: int
+    added_partial_count: int = 0
     skipped_count: int
     failed_count: int
 

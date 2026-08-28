@@ -26,6 +26,7 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
+from typing import Any
 
 import litellm
 
@@ -1734,7 +1735,7 @@ async def _compile_concepts(
     rewrite_summary: bool = False,
     entity_types: list[str] | None = None,
     bundle=None,
-) -> None:
+) -> bool:
     """Shared Steps 2-4: concepts plan → generate/update → index.
 
     Uses ``_CONCEPTS_PLAN_USER`` to get a plan with create/update/related
@@ -1743,6 +1744,11 @@ async def _compile_concepts(
     written to disk. When ``rewrite_summary=True`` (short-doc path), the
     summary is rewritten by the LLM after concepts are finalized so its
     wikilinks reflect the actual concept pages on disk.
+
+    Returns ``True`` when every planned concept and entity was written
+    (after the deferred retry sweep), ``False`` if any are still missing —
+    the caller uses this to decide whether the source document can be
+    considered fully compiled.
     """
     source_file = f"summaries/{doc_name}.md"
 
@@ -1819,7 +1825,9 @@ async def _compile_concepts(
         if rewrite_summary:
             _write_v1_summary_stripped()
         _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
-        return
+        # Unparseable plan output means nothing was even attempted — treat as
+        # incomplete (not a "nothing to do" success) so the caller retries.
+        return False
 
     # Fallback: if LLM returns a flat list, treat all items as "create".
     # The new plan contract nests concepts under a "concepts" key alongside
@@ -1839,7 +1847,9 @@ async def _compile_concepts(
         if rewrite_summary:
             _write_v1_summary_stripped()
         _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
-        return
+        # Same as above: a scalar plan is a malformed-response case, not a
+        # deliberate "no concepts here" plan — treat as incomplete.
+        return False
 
     if isinstance(parsed, list):
         plan = {"create": _filter_concept_items(parsed, "list"), "update": [], "related": []}
@@ -1921,7 +1931,12 @@ async def _compile_concepts(
         if rewrite_summary:
             _write_v1_summary_stripped()
         _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
-        return
+        # A genuinely empty plan (original_total == 0) is a complete, valid
+        # outcome — nothing was planned, so nothing is missing. But if items
+        # were planned and all got dropped as malformed (original_total > 0,
+        # already warned above), that's real content loss — report incomplete
+        # so the caller retries instead of silently accepting it.
+        return original_total == 0
 
     # Build the whitelist of valid wikilink targets the LLM may emit. It
     # combines what already exists on disk with what *this* round will
@@ -2093,17 +2108,30 @@ async def _compile_concepts(
         _require_nonempty_content(content, name)
         return name, content, brief, etype_out
 
-    tasks = []
-    tasks.extend(_gen_create(c) for c in create_items)
-    tasks.extend(_gen_update(c) for c in update_items)
+    # Kept alongside the coroutine lists below (in the same create-then-update
+    # order) so a failed item can be identified and retried by calling the
+    # same generator function again with its original plan dict — see the
+    # deferred retry sweep after the first gather.
+    concept_task_items: list[tuple[str, dict]] = [("create", c) for c in create_items] + [
+        ("update", c) for c in update_items
+    ]
+    entity_task_items: list[tuple[str, dict]] = [("create", e) for e in entity_create] + [
+        ("update", e) for e in entity_update
+    ]
+
+    def _run_concept(kind: str, item: dict):
+        return _gen_create(item) if kind == "create" else _gen_update(item)
+
+    def _run_entity(kind: str, item: dict):
+        return _gen_entity_create(item) if kind == "create" else _gen_entity_update(item)
+
+    tasks = [_run_concept(kind, item) for kind, item in concept_task_items]
 
     # --- Step 3 (entities): build the entity task list up front so it can be
     # gathered concurrently with the concept tasks below. Entity coroutines
     # return 4-arity tuples (name, content, brief, type), so their results are
     # processed in their own loop rather than mixed with the concept tuples.
-    entity_tasks = []
-    entity_tasks.extend(_gen_entity_create(e) for e in entity_create)
-    entity_tasks.extend(_gen_entity_update(e) for e in entity_update)
+    entity_tasks = [_run_entity(kind, item) for kind, item in entity_task_items]
 
     concept_names: list[str] = []
     concept_briefs_map: dict[str, str] = {}
@@ -2126,12 +2154,60 @@ async def _compile_concepts(
         )
         sys.stdout.flush()
 
-    results, entity_results = ([], [])
+    results: list[Any] = []
+    entity_results: list[Any] = []
     if tasks or entity_tasks:
         results, entity_results = await asyncio.gather(
             asyncio.gather(*tasks, return_exceptions=True),
             asyncio.gather(*entity_tasks, return_exceptions=True),
         )
+
+    # --- Deferred retry sweep -------------------------------------------------
+    # LiteLLM's own ``num_retries`` already retries a failing call, but those
+    # retries fire back-to-back against the very same transient provider hiccup
+    # (e.g. an Anthropic gateway timeout). Once every item in the batch has had
+    # its first attempt, retry only the ones that failed: by now real wall-clock
+    # time has passed (the rest of the batch ran in the meantime), giving a
+    # transient failure a real chance to have cleared, while Anthropic's prompt
+    # cache (~5 min TTL) is still warm from the sibling calls — so the retry is
+    # nearly as cheap as the original attempt. Bounded to a single extra sweep
+    # (not unbounded retries).
+    failed_concepts = [
+        (kind, item)
+        for (kind, item), r in zip(concept_task_items, results)
+        if isinstance(r, Exception)
+    ]
+    failed_entities = [
+        (kind, item)
+        for (kind, item), r in zip(entity_task_items, entity_results)
+        if isinstance(r, Exception)
+    ]
+    if failed_concepts or failed_entities:
+        sys.stdout.write(
+            f"    Retrying {len(failed_concepts)} concept(s) and {len(failed_entities)} "
+            "entity(ies) that failed on the first attempt...\n"
+        )
+        sys.stdout.flush()
+        retry_results, retry_entity_results = await asyncio.gather(
+            asyncio.gather(
+                *(_run_concept(kind, item) for kind, item in failed_concepts),
+                return_exceptions=True,
+            ),
+            asyncio.gather(
+                *(_run_entity(kind, item) for kind, item in failed_entities),
+                return_exceptions=True,
+            ),
+        )
+        # Splice the retry outcomes back into the original result lists (in
+        # the same relative order the failures were collected in), so the
+        # processing below sees a single, already-reconciled result set and
+        # doesn't need to know a retry sweep happened.
+        retry_iter = iter(retry_results)
+        results = [next(retry_iter) if isinstance(r, Exception) else r for r in results]
+        retry_entity_iter = iter(retry_entity_results)
+        entity_results = [
+            next(retry_entity_iter) if isinstance(r, Exception) else r for r in entity_results
+        ]
 
     if tasks:
         failure_types: list[str] = []
@@ -2331,6 +2407,13 @@ async def _compile_concepts(
         entity_meta=entity_meta,
     )
 
+    # True only if every planned concept and entity survived the retry sweep
+    # above. Callers (compile_short_doc/compile_long_doc → add_single_file)
+    # use this to avoid registering the source hash / deleting the raw file
+    # when some planned updates are still missing, so the next `openkb add`
+    # of the same file retries them instead of silently losing them.
+    return len(pending_writes) >= total and len(entity_pending) >= etotal
+
 
 async def compile_short_doc(
     doc_name: str,
@@ -2339,11 +2422,14 @@ async def compile_short_doc(
     model: str,
     max_concurrency: int = DEFAULT_COMPILE_CONCURRENCY,
     bundle=None,
-) -> None:
+) -> bool:
     """Compile a short document using a multi-step LLM pipeline with caching.
 
     Step 1: Build base context A (schema + doc content), generate summary.
     Steps 2-4: Delegated to ``_compile_concepts``.
+
+    Returns ``True`` iff every planned concept/entity update was written
+    (see ``_compile_concepts``); ``False`` signals a partial compile.
     """
     from openkb.config import resolve_effective_config
 
@@ -2397,7 +2483,7 @@ async def compile_short_doc(
 
     # --- Steps 2-4: Concept plan → generate/update → summary rewrite → index ---
     try:
-        await _compile_concepts(
+        return await _compile_concepts(
             wiki_dir,
             kb_dir,
             model,
@@ -2427,11 +2513,14 @@ async def compile_long_doc(
     doc_description: str = "",
     max_concurrency: int = DEFAULT_COMPILE_CONCURRENCY,
     bundle=None,
-) -> None:
+) -> bool:
     """Compile a long (PageIndex) document's concepts and index.
 
     The summary page is already written by the indexer. This function
     generates concept pages and updates the index.
+
+    Returns ``True`` iff every planned concept/entity update was written
+    (see ``_compile_concepts``); ``False`` signals a partial compile.
     """
     from openkb.config import resolve_effective_config
 
@@ -2482,7 +2571,7 @@ async def compile_long_doc(
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     try:
-        await _compile_concepts(
+        return await _compile_concepts(
             wiki_dir,
             kb_dir,
             model,

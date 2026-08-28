@@ -1882,6 +1882,93 @@ class TestCompileConceptsPlan:
             )
         assert not (wiki / "concepts" / "ghost.md").exists(), "truncated create must be skipped"
 
+    @pytest.mark.asyncio
+    async def test_retry_sweep_recovers_concept_that_failed_first_attempt(self, tmp_path):
+        """A concept whose first attempt raises (simulating a transient
+        provider error, e.g. a gateway timeout) is retried once more after the
+        rest of the batch has run. If the retry succeeds, the page is written
+        and _compile_concepts reports full success (True)."""
+        wiki = self._setup_wiki(tmp_path)
+        plan_response = json.dumps(
+            {
+                "create": [
+                    {"name": "alpha", "title": "Alpha"},
+                    {"name": "beta", "title": "Beta"},
+                ],
+                "update": [],
+                "related": [],
+            }
+        )
+        alpha_response = json.dumps({"brief": "a", "content": "# Alpha\n\nRecovered on retry."})
+        beta_response = json.dumps({"brief": "b", "content": "# Beta\n\nFine first try."})
+
+        call_count = {"n": 0}
+
+        async def flaky_acompletion(*args, **kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                # First attempt overall (alpha, since max_concurrency=1 keeps
+                # this deterministic) fails like a transient gateway timeout.
+                raise RuntimeError("simulated transient gateway timeout")
+            mock_resp = MagicMock()
+            mock_resp.choices = [MagicMock()]
+            mock_resp.choices[0].message.content = beta_response if idx == 1 else alpha_response
+            mock_resp.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
+            mock_resp.usage.prompt_tokens_details = None
+            return mock_resp
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=_mock_completion([plan_response]))
+            mock_litellm.acompletion = AsyncMock(side_effect=flaky_acompletion)
+            result = await _compile_concepts(
+                wiki,
+                tmp_path,
+                "gpt-4o-mini",
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "d"},
+                "summary",
+                "test-doc",
+                1,  # max_concurrency=1 for deterministic call ordering
+            )
+
+        assert result is True, "the retry sweep should recover the failed concept"
+        assert (wiki / "concepts" / "beta.md").exists()
+        assert (wiki / "concepts" / "alpha.md").exists(), "alpha must be written after its retry"
+        assert "Recovered on retry." in (wiki / "concepts" / "alpha.md").read_text()
+        # alpha (fails) + beta (ok) + alpha retry (ok) = 3 acompletion calls.
+        assert call_count["n"] == 3
+
+    @pytest.mark.asyncio
+    async def test_compile_concepts_reports_partial_when_retry_also_fails(self, tmp_path):
+        """When a concept fails both its first attempt and the deferred retry,
+        _compile_concepts must report incomplete (False) instead of silently
+        treating the document as fully compiled."""
+        wiki = self._setup_wiki(tmp_path)
+        plan_response = json.dumps(
+            {"create": [{"name": "ghost", "title": "Ghost"}], "update": [], "related": []}
+        )
+
+        async def always_fails(*args, **kwargs):
+            raise RuntimeError("simulated persistent gateway timeout")
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=_mock_completion([plan_response]))
+            mock_litellm.acompletion = AsyncMock(side_effect=always_fails)
+            result = await _compile_concepts(
+                wiki,
+                tmp_path,
+                "gpt-4o-mini",
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "d"},
+                "summary",
+                "test-doc",
+                1,
+            )
+
+        assert result is False, "a concept that fails both attempts must be reported as incomplete"
+        assert not (wiki / "concepts" / "ghost.md").exists()
+
     def test_page_fields_maps_response_shapes(self):
         """Shared mapping used by all four page closures: object, single-element
         array unwrap, wrong-shape skip (empty content), and non-JSON prose
