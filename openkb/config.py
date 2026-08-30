@@ -36,6 +36,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # global/KB list overrides it wholesale; resolve_entity_types cleans the
     # effective value on read.
     "entity_types": list(DEFAULT_ENTITY_TYPES),
+    # Enables per-file DEBUG logging (redirected to logs/<file>.log, never the
+    # console — see `openkb.cli._per_file_debug_log`) without needing the CLI's
+    # `-v`/`--verbose` flag on every invocation. Handy for unattended/batch
+    # `add` runs where a few files fail and the detailed traceback/LLM request
+    # dump is only needed after the fact. Deliberately NOT in GLOBAL_SCALAR_KEYS
+    # (KB config.yaml only, no global.yaml default / REST API exposure) — it's
+    # a CLI power-user diagnostic switch, not a workbench-editable setting.
+    "debug": False,
 }
 
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "openkb"

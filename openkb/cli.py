@@ -10,6 +10,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -87,6 +88,71 @@ warnings.filterwarnings("ignore")
 load_dotenv()  # load from cwd (covers running inside the KB dir)
 
 logger = logging.getLogger(__name__)
+
+# Name of the per-KB directory that holds per-file debug logs (see
+# ``_per_file_debug_log``), a sibling of raw/, sources/, wiki/.
+DEBUG_LOGS_DIRNAME = "logs"
+
+
+def _configure_console_logging() -> None:
+    """Set up root logging so the console only ever shows WARNING+ messages.
+
+    Historically ``-v``/``--verbose`` raised the ``openkb`` logger to DEBUG
+    *and* let that flow straight to the console via the root handler
+    ``logging.basicConfig`` installs, which is unusable for a batch ``add``
+    over many files (the request/response dump for every LLM call would
+    scroll past). DEBUG detail is instead captured per file by
+    ``_per_file_debug_log`` into ``logs/<file>.log`` — this function just
+    pins the console handler's own level to WARNING so it can never emit
+    DEBUG/INFO records regardless of what level a logger further up allows
+    through (``-v`` still controls whether those records are created at all).
+    """
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(name)s %(levelname)s: %(message)s"))
+        root_logger.addHandler(handler)
+    for existing_handler in root_logger.handlers:
+        existing_handler.setLevel(logging.WARNING)
+    root_logger.setLevel(logging.WARNING)
+
+
+@contextlib.contextmanager
+def _per_file_debug_log(kb_dir: Path, file_path: Path, *, enabled: bool):
+    """Redirect DEBUG logging for one ``add``-pipeline file to its own log file.
+
+    When ``enabled`` (from ``-v``/``--verbose`` or the KB's ``debug: true``
+    config key — see ``_add_single_file_locked``), every ``openkb.*`` log
+    record produced while this context is active (conversion, PageIndex
+    indexing, LLM compilation) is additionally written to
+    ``kb_dir/logs/<file_path.name>.log``, overwriting any log from a previous
+    run of the same file. The console is untouched: ``_configure_console_logging``
+    already caps its handler at WARNING, so this is purely additive. A no-op
+    (yields immediately) when ``enabled`` is falsy, so callers can use this
+    unconditionally without branching.
+    """
+    if not enabled:
+        yield
+        return
+
+    logs_dir = kb_dir / DEBUG_LOGS_DIRNAME
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{file_path.name}.log"
+
+    openkb_logger = logging.getLogger("openkb")
+    previous_level = openkb_logger.level
+    openkb_logger.setLevel(logging.DEBUG)
+
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
+    openkb_logger.addHandler(file_handler)
+    try:
+        yield
+    finally:
+        openkb_logger.removeHandler(file_handler)
+        file_handler.close()
+        openkb_logger.setLevel(previous_level)
 
 
 _KNOWN_PROVIDER_KEYS = (
@@ -455,6 +521,31 @@ def add_single_file(
 def _add_single_file_locked(
     file_path: Path, kb_dir: Path, *, stage: bool = True, bundle=None
 ) -> Literal["added", "skipped", "failed"]:
+    """Resolve per-file debug logging, then run the add pipeline.
+
+    Debug logging is enabled by ``-v``/``--verbose`` (process-wide, checked
+    via the ``openkb`` logger's effective level) or the KB's ``debug: true``
+    config key; either source routes this file's DEBUG detail to
+    ``logs/<file_path.name>.log`` instead of the console — see
+    ``_per_file_debug_log``. The actual conversion/index/compile pipeline is
+    in ``_add_single_file``.
+    """
+    config = resolve_effective_config(kb_dir)[0]
+    debug_enabled = bool(config.get("debug")) or logging.getLogger("openkb").isEnabledFor(
+        logging.DEBUG
+    )
+    with _per_file_debug_log(kb_dir, file_path, enabled=debug_enabled):
+        return _add_single_file(file_path, kb_dir, config, stage=stage, bundle=bundle)
+
+
+def _add_single_file(
+    file_path: Path,
+    kb_dir: Path,
+    config: dict,
+    *,
+    stage: bool = True,
+    bundle=None,
+) -> Literal["added", "skipped", "failed"]:
     """Convert, index, and compile a single document into the knowledge base.
 
     Steps:
@@ -475,7 +566,6 @@ def _add_single_file_locked(
     from openkb.state import HashRegistry
 
     openkb_dir = kb_dir / ".openkb"
-    config = resolve_effective_config(kb_dir)[0]
     # The REST API passes a per-KB credential bundle so it never pollutes
     # process-wide state; only the CLI path needs the legacy global setup.
     if bundle is None:
@@ -838,10 +928,7 @@ def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> Literal["added", "
 @click.pass_context
 def cli(ctx, verbose, kb_dir_override):
     """OpenKB — Karpathy's LLM Knowledge Base workflow, powered by PageIndex."""
-    logging.basicConfig(
-        format="%(name)s %(levelname)s: %(message)s",
-        level=logging.WARNING,
-    )
+    _configure_console_logging()
     if verbose:
         logging.getLogger("openkb").setLevel(logging.DEBUG)
     ctx.ensure_object(dict)

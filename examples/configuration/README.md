@@ -104,6 +104,14 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 #   extra_headers:         # extra HTTP headers some providers need (e.g. GitHub Copilot)
 #     Editor-Version: vscode/1.95.0
 #     Copilot-Integration-Id: vscode-chat
+
+# Optional: enable detailed per-file debug logging without passing `-v` on
+# every command. Each processed file gets its own log at
+# logs/<file-name>.<ext>.log (created next to raw/, sources/, wiki/) with the
+# full LLM request/response dump and tracebacks; the console keeps showing
+# only the normal status lines and WARNING+ messages. Handy for unattended
+# batch `add` runs where you only want to dig into the log after a failure.
+# debug: true
 ```
 
 | Key | Default | What it does |
@@ -114,7 +122,24 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 | `concurrency` | `null` | Caps concurrent LLM calls OpenKB makes during ingest — both PageIndex's indexing of a long document and OpenKB's own concept/entity compilation. The two never run at once for the same document, so one setting covers both. Lower it if you hit provider rate limits or "too many open files" on large PDFs. `null` lets each stage apply its own default. |
 | `parallel_tool_calls` | unset | Whether the LLM agents (query, chat, lint, skill) may call tools in parallel. Unset keeps OpenKB's per-agent defaults; `true`/`false` force allow/sequential for every agent; `null` omits the setting (provider default). **Amazon Bedrock needs `null`** (see below). |
 | `entity_types` | 7 defaults | Custom vocabulary for entity pages. `other` is always kept. |
+| `debug` | `false` | Enable per-file debug logging to `logs/<file>.log` (see below) without needing `-v` on every command. |
 | `litellm:` | – | A pass-through block for LiteLLM. See below. |
+
+### Debug logging
+
+`openkb -v <command>` and `debug: true` in `config.yaml` do the same thing: they
+turn on OpenKB's DEBUG logging (full LLM request/response text, stage
+tracebacks). The two differ only in scope and destination:
+
+- `-v` is a one-off, process-wide flag for any command.
+- `debug: true` in `.openkb/config.yaml` is sticky per-KB, and only affects
+  `openkb add` (including a directory/batch add and the REST API's `/add`).
+  For each file being added, OpenKB writes a fresh `logs/<file-name>.<ext>.log`
+  (e.g. `logs/report.pdf.log`) next to `raw/`, `sources/`, `wiki/` — the
+  console still only shows the normal `Adding: ...` / `[OK]` / `[ERROR]`
+  status lines and any WARNING+ message, never the DEBUG detail. This keeps a
+  large batch `openkb add some-dir/` readable while still letting you dig
+  into exactly why an individual file failed afterward.
 
 ### The `litellm:` block
 
