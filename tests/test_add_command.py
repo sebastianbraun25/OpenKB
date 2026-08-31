@@ -564,11 +564,12 @@ class TestPerFileDebugLogging:
         assert log_path.exists()
         assert "Compilation traceback" in log_path.read_text(encoding="utf-8")
 
-    def test_debug_log_retained_on_skipped(self, tmp_path):
-        """A "skipped" (dedup) run keeps its log too — an explicit equality
-        check on "added" (not e.g. `!= "failed"`) is what makes this possible:
-        a later third outcome would default to "kept" unless added to the
-        delete condition explicitly."""
+    def test_debug_log_deleted_on_skipped(self, tmp_path):
+        """A "skipped" (dedup) run also deletes its log — the pipeline never
+        even ran, so there's nothing new to debug. An explicit
+        `outcome in ("added", "skipped")` check (not e.g. `!= "failed"`) is
+        what makes this possible: a later third outcome would default to
+        "kept" unless added to the delete condition explicitly."""
         from openkb.cli import add_single_file
         from openkb.converter import ConvertResult
 
@@ -583,7 +584,7 @@ class TestPerFileDebugLogging:
             outcome = add_single_file(doc, kb_dir)
 
         assert outcome == "skipped"
-        assert (kb_dir / "logs" / "notes.md.log").exists()
+        assert not (kb_dir / "logs" / "notes.md.log").exists()
 
     def test_verbose_flag_also_triggers_per_file_log(self, tmp_path):
         """`-v` (process-wide DEBUG on the `openkb` logger) must be honored

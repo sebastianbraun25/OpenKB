@@ -141,9 +141,10 @@ tracebacks). The two differ only in scope and destination:
   large batch `openkb add some-dir/` readable while still letting you dig
   into exactly why an individual file failed afterward. The log is deleted
   automatically once the file's outcome is exactly `"added"` (a fresh,
-  successful compile has nothing left to debug); it is kept on `"skipped"`
-  (dedup — nothing new happened) and `"failed"` (the whole point of turning
-  this on) so you can inspect it after the batch finishes.
+  successful compile) or `"skipped"` (a dedup hit that never ran the
+  pipeline) — both have nothing left to debug. It is kept only on `"failed"`,
+  the whole point of turning this on, so you can inspect it after the batch
+  finishes.
 
 ### The `litellm:` block
 
