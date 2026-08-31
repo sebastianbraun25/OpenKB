@@ -507,7 +507,9 @@ class TestPerFileDebugLogging:
         assert outcome == "added"
         assert not (kb_dir / "logs").exists()
 
-    def test_debug_config_writes_per_file_log(self, tmp_path):
+    def test_debug_config_writes_per_file_log_deleted_on_added(self, tmp_path):
+        """A successful ("added") run's log is deleted once the outcome is
+        known — a fresh, successful compile has nothing left to debug."""
         from unittest.mock import AsyncMock
 
         from openkb.cli import add_single_file
@@ -533,18 +535,62 @@ class TestPerFileDebugLogging:
             outcome = add_single_file(doc, kb_dir)
 
         assert outcome == "added"
-        log_path = kb_dir / "logs" / "notes.md.log"
-        assert log_path.exists()
-        assert "marker: fake LLM request dump" in log_path.read_text(encoding="utf-8")
+        assert not (kb_dir / "logs" / "notes.md.log").exists()
         # `_per_file_debug_log` must restore the `openkb` logger's prior level
         # once the file finishes, so a later non-debug file isn't affected.
         assert logging.getLogger("openkb").level != logging.DEBUG
 
+    def test_debug_log_retained_on_failed(self, tmp_path):
+        """A "failed" run keeps its log — that's the entire point of turning
+        debug logging on (inspecting exactly why a file failed)."""
+        from openkb.cli import add_single_file
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text(
+            "model: gpt-4o-mini\ndebug: true\n", encoding="utf-8"
+        )
+        doc = tmp_path / "notes.md"
+        doc.write_text("# Notes\n\nBody", encoding="utf-8")
+
+        with (
+            patch("openkb.agent.compiler.compile_short_doc", side_effect=RuntimeError("boom")),
+            patch("openkb.cli.time.sleep"),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "failed"
+        log_path = kb_dir / "logs" / "notes.md.log"
+        assert log_path.exists()
+        assert "Compilation traceback" in log_path.read_text(encoding="utf-8")
+
+    def test_debug_log_retained_on_skipped(self, tmp_path):
+        """A "skipped" (dedup) run keeps its log too — an explicit equality
+        check on "added" (not e.g. `!= "failed"`) is what makes this possible:
+        a later third outcome would default to "kept" unless added to the
+        delete condition explicitly."""
+        from openkb.cli import add_single_file
+        from openkb.converter import ConvertResult
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text(
+            "model: gpt-4o-mini\ndebug: true\n", encoding="utf-8"
+        )
+        doc = tmp_path / "notes.md"
+        doc.write_text("# Notes\n\nBody", encoding="utf-8")
+
+        with patch("openkb.cli.convert_document", return_value=ConvertResult(skipped=True)):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "skipped"
+        assert (kb_dir / "logs" / "notes.md.log").exists()
+
     def test_verbose_flag_also_triggers_per_file_log(self, tmp_path):
         """`-v` (process-wide DEBUG on the `openkb` logger) must be honored
-        the same way as `debug: true`, even without setting it in config.yaml."""
-        from unittest.mock import AsyncMock
-
+        the same way as `debug: true`, even without setting it in config.yaml.
+        Uses a forced failure so the log is retained and its content can be
+        asserted (a success would delete it — see
+        `test_debug_config_writes_per_file_log_deleted_on_added`)."""
         from openkb.cli import add_single_file
 
         kb_dir = self._setup_kb(tmp_path)
@@ -554,23 +600,17 @@ class TestPerFileDebugLogging:
 
         logging.getLogger("openkb").setLevel(logging.DEBUG)  # simulates `-v`
 
-        async def fake_compile(*args, **kwargs):
-            logging.getLogger("openkb.agent.compiler").debug("marker: verbose path")
-
         with (
-            patch(
-                "openkb.agent.compiler.compile_short_doc",
-                new_callable=AsyncMock,
-                side_effect=fake_compile,
-            ),
+            patch("openkb.agent.compiler.compile_short_doc", side_effect=RuntimeError("boom")),
+            patch("openkb.cli.time.sleep"),
             patch("openkb.cli._setup_llm_key"),
         ):
             outcome = add_single_file(doc, kb_dir)
 
-        assert outcome == "added"
+        assert outcome == "failed"
         log_path = kb_dir / "logs" / "report.md.log"
         assert log_path.exists()
-        assert "marker: verbose path" in log_path.read_text(encoding="utf-8")
+        assert "Compilation traceback" in log_path.read_text(encoding="utf-8")
 
     def test_configure_console_logging_caps_handler_at_warning(self):
         """Even when a logger's own level allows DEBUG through (e.g. after
