@@ -589,11 +589,13 @@ def _add_single_file_locked(
     in ``_add_single_file``.
 
     The log is deleted once the outcome is known, but ONLY on an exact
-    ``"added"`` match — not e.g. ``!= "failed"`` — so a future third outcome
-    (say, a partial/degraded success) can be added later without silently
-    inheriting delete-on-success just because it isn't "failed". "skipped"
-    keeps its log too: a dedup hit is not a fresh compile run, so there is
-    nothing new in it to discard.
+    ``"added"``/``"skipped"`` match — not e.g. ``!= "failed"`` — so a future
+    third outcome (say, a partial/degraded success) can be added later
+    without silently inheriting delete-on-success just because it isn't
+    "failed". Both kept outcomes have nothing new left to debug: "added" is a
+    successful fresh compile, and "skipped" is a dedup hit that never even
+    ran the pipeline. Only "failed" keeps its log — the whole point of
+    turning debug logging on.
     """
     config = resolve_effective_config(kb_dir)[0]
     debug_enabled = bool(config.get("debug")) or logging.getLogger("openkb").isEnabledFor(
@@ -601,7 +603,7 @@ def _add_single_file_locked(
     )
     with _per_file_debug_log(kb_dir, file_path, enabled=debug_enabled) as log_path:
         outcome = _add_single_file(file_path, kb_dir, config, stage=stage, bundle=bundle)
-    if log_path is not None and outcome == "added":
+    if log_path is not None and outcome in ("added", "skipped"):
         log_path.unlink(missing_ok=True)
     return outcome
 
