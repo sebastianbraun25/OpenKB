@@ -45,7 +45,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (KB config.yaml only, no global.yaml default / REST API exposure) — it's
     # a CLI power-user diagnostic switch, not a workbench-editable setting.
     "debug": False,
+    # How a partial compile is reported — see resolve_insert_mode().
+    "insert_mode": "normal",
 }
+
+VALID_INSERT_MODES: tuple[str, ...] = ("normal", "fail-fast", "fail-at-end")
 
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "openkb"
 GLOBAL_CONFIG_PATH = GLOBAL_CONFIG_DIR / "global.yaml"
@@ -268,6 +272,24 @@ def resolve_concurrency(config: dict) -> int | None:
             value,
         )
         return None
+    return value
+
+
+def resolve_insert_mode(config: dict) -> str:
+    """Resolve ``insert_mode:`` — ``"normal"`` (default, unchanged), or the
+    strict ``"fail-fast"``/``"fail-at-end"``, which raise
+    ``ConceptCompilationError`` (``openkb.agent.compiler``) so the mutation
+    rolls back and the file is reported ``"failed"``. Invalid values degrade
+    to ``"normal"`` with a warning.
+    """
+    value = config.get("insert_mode", "normal")
+    if value not in VALID_INSERT_MODES:
+        logger.warning(
+            "config: 'insert_mode' must be one of %s, got %r — using 'normal'.",
+            VALID_INSERT_MODES,
+            value,
+        )
+        return "normal"
     return value
 
 

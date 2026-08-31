@@ -24,6 +24,14 @@ _GRANDFATHERED = {
     "openkb/cli.py",  # monolithic Click entry point; split into command groups
     "openkb/agent/compiler.py",  # LLM wiki compiler; split into focused units
     "openkb/agent/chat.py",  # chat loop; extract cohesive concerns
+    # Fork-local, temporary: this fork's `integration` branch hasn't synced
+    # upstream/main's own config.py growth (entity_types, credential bundle,
+    # per-request overrides) in a while, so a routine, unrelated merge into
+    # `integration` pushes it just over the limit here. Not present upstream
+    # (upstream/main's config.py is under the limit on its own) — remove this
+    # entry the next time `integration` merges `main` (see openkb-contributing
+    # -workflow skill, section 10).
+    "openkb/config.py",
 }
 
 
