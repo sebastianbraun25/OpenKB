@@ -30,6 +30,7 @@ class ConvertResult:
     skipped: bool = False
     file_hash: str | None = None  # For deferred hash registration
     doc_name: str | None = None  # Stable wiki name (collision-resistant)
+    markdown_text: str | None = None  # In-memory converted content (short-doc branch only)
 
 
 def _registry_path(path: Path, kb_dir: Path) -> str:
@@ -251,4 +252,5 @@ def convert_document(
             source_path=dest_md,
             file_hash=file_hash,
             doc_name=doc_name,
+            markdown_text=markdown,
         )

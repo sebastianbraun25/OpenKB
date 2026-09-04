@@ -20,7 +20,7 @@ import time
 import uuid
 from functools import wraps
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import os
 
@@ -64,7 +64,9 @@ from openkb.config import (
     resolve_per_request_overrides,
 )
 from openkb.add_coordinator import _cleanup_staging_dirs
+from openkb.add_ordering import extract_local_document_links, reorder_queue
 from openkb.converter import (
+    ConvertResult,
     _registry_path,
     _sanitize_stem,
     convert_document,
@@ -522,11 +524,25 @@ def _run_compile_with_retry(coro_factory, label: str) -> None:
 
 
 def add_single_file(
-    file_path: Path, kb_dir: Path, *, stage: bool = True, bundle=None
+    file_path: Path,
+    kb_dir: Path,
+    *,
+    stage: bool = True,
+    bundle=None,
+    on_converted: Callable[[ConvertResult], None] | None = None,
 ) -> Literal["added", "skipped", "failed"]:
-    """Convert, index, and compile a single document under the KB mutation lock."""
+    """Convert, index, and compile a single document under the KB mutation lock.
+
+    ``on_converted``, if given, is called with the ``ConvertResult`` right
+    after conversion succeeds (before compilation) — used by the directory
+    ``add`` loop to react to a document's content (e.g. reorder the
+    processing queue based on local links) without needing to run
+    conversion twice.
+    """
     with kb_ingest_lock(kb_dir / ".openkb"):
-        return _add_single_file_locked(file_path, kb_dir, stage=stage, bundle=bundle)
+        return _add_single_file_locked(
+            file_path, kb_dir, stage=stage, bundle=bundle, on_converted=on_converted
+        )
 
 
 def _delete_if_auto_cleanup_enabled(
@@ -582,8 +598,36 @@ def _cleanup_empty_directories(start_dir: Path) -> int:
     return deleted_count
 
 
+def _cleanup_empty_parent_dirs(deleted_file_parent: Path, stop_at: Path) -> int:
+    """Remove now-empty directories from ``deleted_file_parent`` upward, excluding ``stop_at``.
+
+    Targeted counterpart to ``_cleanup_empty_directories``: called right after
+    a single file is deleted during the ``add`` loop so a subdirectory empties
+    out as soon as its last file is processed, instead of only once at the
+    very end of the whole run.
+    """
+    deleted_count = 0
+    stop_at = stop_at.resolve()
+    current = deleted_file_parent.resolve()
+    while current != stop_at and stop_at in current.parents:
+        try:
+            if list(current.iterdir()):
+                break
+            current.rmdir()
+            deleted_count += 1
+        except OSError:
+            break
+        current = current.parent
+    return deleted_count
+
+
 def _add_single_file_locked(
-    file_path: Path, kb_dir: Path, *, stage: bool = True, bundle=None
+    file_path: Path,
+    kb_dir: Path,
+    *,
+    stage: bool = True,
+    bundle=None,
+    on_converted: Callable[[ConvertResult], None] | None = None,
 ) -> Literal["added", "skipped", "failed"]:
     """Resolve per-file debug logging, then run the add pipeline.
 
@@ -608,7 +652,9 @@ def _add_single_file_locked(
         logging.DEBUG
     )
     with _per_file_debug_log(kb_dir, file_path, enabled=debug_enabled) as log_path:
-        outcome = _add_single_file(file_path, kb_dir, config, stage=stage, bundle=bundle)
+        outcome = _add_single_file(
+            file_path, kb_dir, config, stage=stage, bundle=bundle, on_converted=on_converted
+        )
     if log_path is not None and outcome in ("added", "skipped"):
         log_path.unlink(missing_ok=True)
     return outcome
@@ -621,6 +667,7 @@ def _add_single_file(
     *,
     stage: bool = True,
     bundle=None,
+    on_converted: Callable[[ConvertResult], None] | None = None,
 ) -> Literal["added", "skipped", "failed"]:
     """Convert, index, and compile a single document into the knowledge base.
 
@@ -664,6 +711,9 @@ def _add_single_file(
         click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
         _cleanup_staging_dirs([staging_dir])
         return "skipped"
+
+    if on_converted is not None:
+        on_converted(result)
 
     doc_name = result.doc_name or file_path.stem
     index_result = None  # populated only on the long-doc branch
@@ -1313,20 +1363,42 @@ def add(ctx, path, from_pageindex_cloud):
             return
 
     if target.is_dir():
-        files = [
+        # Root files first, then subdirectory files (each group alphabetical) —
+        # a plain rglob("*") sort mixes both, so e.g. an "attachment-*"
+        # subdirectory could sort before its own root-level document purely
+        # by string comparison. Link-based reordering below then operates on
+        # top of this base order.
+        root_files = sorted(
+            f for f in target.glob("*") if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+        subdir_files = sorted(
             f
-            for f in sorted(target.rglob("*"))
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
-        ]
-        if not files:
+            for f in target.rglob("*")
+            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS and f.parent != target
+        )
+        queue = [f.resolve() for f in (*root_files, *subdir_files)]
+        if not queue:
             click.echo(f"No supported files found in {target}.")
             return
-        total = len(files)
+        candidate_paths = set(queue)
+        already_handled: set[Path] = set()
+        total = len(queue)
         added = skipped = failed = deleted = dirs_deleted = 0
         click.echo(f"Found {total} supported file(s) in {target}.")
-        for i, f in enumerate(files, 1):
-            click.echo(f"\n[{i}/{total}] ", nl=False)
-            outcome = add_single_file(f, kb_dir)
+        i = 0
+        while i < len(queue):
+            f = queue[i]
+            click.echo(f"\n[{i + 1}/{total}] ", nl=False)
+
+            def _on_converted(result: ConvertResult, _index=i, _source_dir=f.parent) -> None:
+                if result.markdown_text is None:
+                    return
+                links = extract_local_document_links(
+                    result.markdown_text, _source_dir, candidate_paths
+                )
+                reorder_queue(queue, _index, links, already_handled)
+
+            outcome = add_single_file(f, kb_dir, on_converted=_on_converted)
             if outcome == "added":
                 added += 1
             elif outcome == "skipped":
@@ -1335,9 +1407,11 @@ def add(ctx, path, from_pageindex_cloud):
                 failed += 1
             if _delete_if_auto_cleanup_enabled(f, outcome, config):
                 deleted += 1
+                dirs_deleted += _cleanup_empty_parent_dirs(f.parent, target)
+            i += 1
 
         if config.get("auto_delete_added_files", False):
-            dirs_deleted = _cleanup_empty_directories(target)
+            dirs_deleted += _cleanup_empty_directories(target)
 
         summary = f"Added: {added}, Skipped: {skipped}, Failed: {failed}, Deleted: {deleted}"
         if dirs_deleted > 0:
