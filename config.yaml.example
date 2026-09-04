@@ -36,3 +36,11 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 #   extra_headers:         # extra HTTP headers some providers need (e.g. GitHub Copilot)
 #     Editor-Version: vscode/1.95.0
 #     Copilot-Integration-Id: vscode-chat
+
+# Optional: enable detailed per-file debug logging without passing `-v` on
+# every command. Each processed file gets its own log at
+# logs/<file-name>.<ext>.log (created next to raw/, sources/, wiki/) with the
+# full LLM request/response dump and tracebacks; the console keeps showing
+# only the normal status lines and WARNING+ messages. Handy for unattended
+# batch `add` runs where you only want to dig into the log after a failure.
+# debug: true

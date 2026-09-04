@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from openkb.cli import SUPPORTED_EXTENSIONS, _find_kb_dir, cli
@@ -527,6 +529,174 @@ class TestAddCommand:
             assert not doc.exists()
             assert not sub_dir.exists()
             assert "Empty dirs cleaned: 1" in result.output
+
+
+class TestPerFileDebugLogging:
+    """`debug: true` (config.yaml) / `-v` must route DEBUG detail to
+    logs/<file>.log per processed file, and never to the console — see
+    `openkb.cli._configure_console_logging` / `_per_file_debug_log`."""
+
+    def _setup_kb(self, tmp_path):
+        (tmp_path / "raw").mkdir()
+        (tmp_path / "wiki" / "sources" / "images").mkdir(parents=True)
+        (tmp_path / "wiki" / "summaries").mkdir(parents=True)
+        (tmp_path / "wiki" / "concepts").mkdir(parents=True)
+        (tmp_path / "wiki" / "reports").mkdir(parents=True)
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        (openkb_dir / "hashes.json").write_text(json.dumps({}))
+        return tmp_path
+
+    @pytest.fixture(autouse=True)
+    def _reset_openkb_logger(self):
+        """Restore the shared `openkb` logger's level/handlers after each test
+        so a leaked DEBUG level or FileHandler never bleeds into other tests."""
+        openkb_logger = logging.getLogger("openkb")
+        original_level = openkb_logger.level
+        original_handlers = list(openkb_logger.handlers)
+        yield
+        openkb_logger.setLevel(original_level)
+        for handler in list(openkb_logger.handlers):
+            if handler not in original_handlers:
+                openkb_logger.removeHandler(handler)
+                handler.close()
+
+    def test_disabled_by_default_creates_no_logs_dir(self, tmp_path):
+        from unittest.mock import AsyncMock
+
+        from openkb.cli import add_single_file
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text("model: gpt-4o-mini\n", encoding="utf-8")
+        doc = tmp_path / "notes.md"
+        doc.write_text("# Notes\n\nBody", encoding="utf-8")
+
+        with (
+            patch("openkb.agent.compiler.compile_short_doc", new_callable=AsyncMock),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "added"
+        assert not (kb_dir / "logs").exists()
+
+    def test_debug_config_writes_per_file_log_deleted_on_added(self, tmp_path):
+        """A successful ("added") run's log is deleted once the outcome is
+        known — a fresh, successful compile has nothing left to debug."""
+        from unittest.mock import AsyncMock
+
+        from openkb.cli import add_single_file
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text(
+            "model: gpt-4o-mini\ndebug: true\n", encoding="utf-8"
+        )
+        doc = tmp_path / "notes.md"
+        doc.write_text("# Notes\n\nBody", encoding="utf-8")
+
+        async def fake_compile(*args, **kwargs):
+            logging.getLogger("openkb.agent.compiler").debug("marker: fake LLM request dump")
+
+        with (
+            patch(
+                "openkb.agent.compiler.compile_short_doc",
+                new_callable=AsyncMock,
+                side_effect=fake_compile,
+            ),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "added"
+        assert not (kb_dir / "logs" / "notes.md.log").exists()
+        # `_per_file_debug_log` must restore the `openkb` logger's prior level
+        # once the file finishes, so a later non-debug file isn't affected.
+        assert logging.getLogger("openkb").level != logging.DEBUG
+
+    def test_debug_log_retained_on_failed(self, tmp_path):
+        """A "failed" run keeps its log — that's the entire point of turning
+        debug logging on (inspecting exactly why a file failed)."""
+        from openkb.cli import add_single_file
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text(
+            "model: gpt-4o-mini\ndebug: true\n", encoding="utf-8"
+        )
+        doc = tmp_path / "notes.md"
+        doc.write_text("# Notes\n\nBody", encoding="utf-8")
+
+        with (
+            patch("openkb.agent.compiler.compile_short_doc", side_effect=RuntimeError("boom")),
+            patch("openkb.cli.time.sleep"),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "failed"
+        log_path = kb_dir / "logs" / "notes.md.log"
+        assert log_path.exists()
+        assert "Compilation traceback" in log_path.read_text(encoding="utf-8")
+
+    def test_debug_log_deleted_on_skipped(self, tmp_path):
+        """A "skipped" (dedup) run also deletes its log — the pipeline never
+        even ran, so there's nothing new to debug. An explicit
+        `outcome in ("added", "skipped")` check (not e.g. `!= "failed"`) is
+        what makes this possible: a later third outcome would default to
+        "kept" unless added to the delete condition explicitly."""
+        from openkb.cli import add_single_file
+        from openkb.converter import ConvertResult
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text(
+            "model: gpt-4o-mini\ndebug: true\n", encoding="utf-8"
+        )
+        doc = tmp_path / "notes.md"
+        doc.write_text("# Notes\n\nBody", encoding="utf-8")
+
+        with patch("openkb.cli.convert_document", return_value=ConvertResult(skipped=True)):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "skipped"
+        assert not (kb_dir / "logs" / "notes.md.log").exists()
+
+    def test_verbose_flag_also_triggers_per_file_log(self, tmp_path):
+        """`-v` (process-wide DEBUG on the `openkb` logger) must be honored
+        the same way as `debug: true`, even without setting it in config.yaml.
+        Uses a forced failure so the log is retained and its content can be
+        asserted (a success would delete it — see
+        `test_debug_config_writes_per_file_log_deleted_on_added`)."""
+        from openkb.cli import add_single_file
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text("model: gpt-4o-mini\n", encoding="utf-8")
+        doc = tmp_path / "report.md"
+        doc.write_text("# Report\n\nBody", encoding="utf-8")
+
+        logging.getLogger("openkb").setLevel(logging.DEBUG)  # simulates `-v`
+
+        with (
+            patch("openkb.agent.compiler.compile_short_doc", side_effect=RuntimeError("boom")),
+            patch("openkb.cli.time.sleep"),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "failed"
+        log_path = kb_dir / "logs" / "report.md.log"
+        assert log_path.exists()
+        assert "Compilation traceback" in log_path.read_text(encoding="utf-8")
+
+    def test_configure_console_logging_caps_handler_at_warning(self):
+        """Even when a logger's own level allows DEBUG through (e.g. after
+        `-v`), the console handler itself must never emit below WARNING —
+        DEBUG detail is only ever written to a per-file log (see
+        `_per_file_debug_log`)."""
+        from openkb.cli import _configure_console_logging
+
+        _configure_console_logging()
+        root_handlers = logging.getLogger().handlers
+        assert root_handlers
+        assert all(h.level >= logging.WARNING for h in root_handlers)
 
 
 class TestImportFromPageindexCloud:
