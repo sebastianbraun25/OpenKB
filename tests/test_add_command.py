@@ -310,6 +310,33 @@ class TestAddCommand:
                 in result.output
             )
 
+    def test_add_directory_reorders_queue_by_local_links(self, tmp_path):
+        from unittest.mock import AsyncMock
+
+        kb_dir = self._setup_kb(tmp_path)
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        # Alphabetical base order would be a, m, z — a's link to z.md must pull
+        # z.md forward to right after a, ahead of m.md.
+        (docs_dir / "a.md").write_text("# A\n\nSee [Z](z.md) for details.", encoding="utf-8")
+        (docs_dir / "m.md").write_text("# M", encoding="utf-8")
+        (docs_dir / "z.md").write_text("# Z", encoding="utf-8")
+
+        runner = CliRunner()
+        with (
+            patch("openkb.agent.compiler.compile_short_doc", new_callable=AsyncMock),
+            patch("openkb.cli._setup_llm_key"),
+            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
+        ):
+            result = runner.invoke(cli, ["add", str(docs_dir)], catch_exceptions=False)
+
+        adding_order = [
+            line.split("Adding: ", 1)[1]
+            for line in result.output.splitlines()
+            if "Adding: " in line
+        ]
+        assert adding_order == ["a.md", "z.md", "m.md"]
+
     def test_add_unsupported_extension(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)
         doc = tmp_path / "file.xyz"
