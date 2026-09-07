@@ -30,6 +30,7 @@ from pathlib import Path
 import litellm
 
 from openkb import frontmatter
+from openkb.agent import compiler_notes
 from openkb.config import (
     DEFAULT_ENTITY_TYPES,
     get_extra_headers,
@@ -1536,6 +1537,8 @@ def _remove_doc_from_pages(
       ``## Related Documents`` section.
     - Remove any standalone ``See also: [[summaries/{doc_name}]]`` lines
       (left by ``_add_related_link``).
+    - Remove this doc's ``## Notes`` line, if any (left by
+      ``concept_update_mode="append"``; a no-op for "rewrite"-mode pages).
     - If the ``sources:`` list becomes empty AND ``keep_empty`` is False,
       delete the page entirely.
 
@@ -1587,6 +1590,17 @@ def _remove_doc_from_pages(
         # `[ \t]` and an optional trailing newline.
         new_text = re.sub(
             rf"^[ \t]*See also:[ \t]*\[\[{re.escape(bare_source)}\]\][ \t]*\n?",
+            "",
+            new_text,
+            flags=re.MULTILINE,
+        )
+
+        # Drop this doc's "## Notes" line (left by
+        # ``compiler_notes.append_concept_note``/``append_entity_note`` under
+        # ``concept_update_mode="append"``) — a no-op on "rewrite"-mode pages,
+        # which never contain this line shape.
+        new_text = re.sub(
+            rf"^- \*\*.*\(\[\[{re.escape(bare_source)}\]\]\)[ \t]*\n?",
             "",
             new_text,
             flags=re.MULTILINE,
@@ -1826,6 +1840,7 @@ async def _compile_concepts(
     doc_type: str = "short",
     rewrite_summary: bool = False,
     entity_types: list[str] | None = None,
+    concept_update_mode: str = "rewrite",
     bundle=None,
     insert_mode: str = "normal",
 ) -> None:
@@ -1858,6 +1873,14 @@ async def _compile_concepts(
     ``compile_short_doc``/``compile_long_doc`` so the caller's existing
     mutation rollback discards this add entirely (see
     ``ConceptCompilationError``).
+
+    ``concept_update_mode`` (see ``openkb.config.resolve_concept_update_mode``)
+    controls how EXISTING concept/entity pages absorb this document: the
+    default ``"rewrite"`` sends the full page back to the LLM for a rewrite;
+    ``"append"`` generates a short note instead (the LLM never sees the
+    existing page) and appends it via ``openkb.agent.compiler_notes`` — no
+    LLM call for the write itself. New pages are generated the same way in
+    both modes for "rewrite" (full content) vs. a note for "append".
     """
     source_file = f"summaries/{doc_name}.md"
 
@@ -2231,15 +2254,140 @@ async def _compile_concepts(
         _require_nonempty_content(content, name)
         return name, content, brief, etype_out
 
-    tasks = []
-    tasks.extend(asyncio.create_task(_gen_create(c)) for c in create_items)
-    tasks.extend(asyncio.create_task(_gen_update(c)) for c in update_items)
+    # --- "append" mode closures: a short note instead of a full-page rewrite.
+    # The LLM never sees the existing page (no existing_content read, no
+    # known_targets_msg turn — notes stay plain text, see compiler_notes.py).
+    # Return shapes are IDENTICAL to the four closures above (name,
+    # content-or-note, is_update-or-brief, brief-or-type), so every downstream
+    # step (gather, ghost-link stripping, index bookkeeping) is shared between
+    # modes — only the final disk write branches (see below).
+    async def _gen_note_create(concept: dict) -> tuple[str, str, bool, str]:
+        name = concept["name"]
+        title = concept.get("title", name)
+        async with semaphore:
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    {
+                        "role": "user",
+                        "content": compiler_notes._CONCEPT_NOTE_CREATE_USER.format(
+                            title=title,
+                            doc_name=doc_name,
+                        ),
+                    },
+                ],
+                f"concept-note: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+        description, note = compiler_notes.note_fields(raw)
+        _require_nonempty_content(note, name)
+        return name, note, False, description
 
-    # Zero-arg factories, same order as `tasks`, so a failed item can be
-    # re-run in isolation by the end-of-first-pass sweep below.
-    concept_factories = [(lambda c=c: _gen_create(c)) for c in create_items] + [
-        (lambda c=c: _gen_update(c)) for c in update_items
-    ]
+    async def _gen_note_update(concept: dict) -> tuple[str, str, bool, str]:
+        name = concept["name"]
+        title = concept.get("title", name)
+        async with semaphore:
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    {
+                        "role": "user",
+                        "content": compiler_notes._CONCEPT_NOTE_UPDATE_USER.format(
+                            title=title,
+                            doc_name=doc_name,
+                        ),
+                    },
+                ],
+                f"concept-note-update: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+        _, note = compiler_notes.note_fields(raw)
+        _require_nonempty_content(note, name)
+        return name, note, True, ""
+
+    async def _gen_entity_note_create(ent: dict) -> tuple[str, str, str, str]:
+        name = ent["name"]
+        title = ent.get("title", name)
+        etype = ent.get("type", "other")
+        async with semaphore:
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    {
+                        "role": "user",
+                        "content": compiler_notes._ENTITY_NOTE_CREATE_USER.format(
+                            title=title,
+                            type=etype,
+                            doc_name=doc_name,
+                        ),
+                    },
+                ],
+                f"entity-note: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+        description, note = compiler_notes.note_fields(raw)
+        _require_nonempty_content(note, name)
+        return name, note, description, etype
+
+    async def _gen_entity_note_update(ent: dict) -> tuple[str, str, str, str]:
+        name = ent["name"]
+        title = ent.get("title", name)
+        etype = ent.get("type", "other")
+        async with semaphore:
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    {
+                        "role": "user",
+                        "content": compiler_notes._ENTITY_NOTE_UPDATE_USER.format(
+                            title=title,
+                            type=etype,
+                            doc_name=doc_name,
+                        ),
+                    },
+                ],
+                f"entity-note-update: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+        _, note = compiler_notes.note_fields(raw)
+        _require_nonempty_content(note, name)
+        return name, note, "", etype
+
+    tasks = []
+    if concept_update_mode == "append":
+        tasks.extend(asyncio.create_task(_gen_note_create(c)) for c in create_items)
+        tasks.extend(asyncio.create_task(_gen_note_update(c)) for c in update_items)
+
+        # Zero-arg factories, same order as `tasks`, so a failed item can be
+        # re-run in isolation by the end-of-first-pass sweep below.
+        concept_factories = [(lambda c=c: _gen_note_create(c)) for c in create_items] + [
+            (lambda c=c: _gen_note_update(c)) for c in update_items
+        ]
+    else:
+        tasks.extend(asyncio.create_task(_gen_create(c)) for c in create_items)
+        tasks.extend(asyncio.create_task(_gen_update(c)) for c in update_items)
+
+        # Zero-arg factories, same order as `tasks`, so a failed item can be
+        # re-run in isolation by the end-of-first-pass sweep below.
+        concept_factories = [(lambda c=c: _gen_create(c)) for c in create_items] + [
+            (lambda c=c: _gen_update(c)) for c in update_items
+        ]
 
     # --- Step 3 (entities): build the entity task list up front so it can be
     # gathered concurrently with the concept tasks below. Entity coroutines
@@ -2248,12 +2396,20 @@ async def _compile_concepts(
     # Wrapped in asyncio.create_task (not left as bare coroutines) so a
     # "fail-fast" insert_mode can cancel the ones still pending below.
     entity_tasks = []
-    entity_tasks.extend(asyncio.create_task(_gen_entity_create(e)) for e in entity_create)
-    entity_tasks.extend(asyncio.create_task(_gen_entity_update(e)) for e in entity_update)
+    if concept_update_mode == "append":
+        entity_tasks.extend(asyncio.create_task(_gen_entity_note_create(e)) for e in entity_create)
+        entity_tasks.extend(asyncio.create_task(_gen_entity_note_update(e)) for e in entity_update)
 
-    entity_factories = [(lambda e=e: _gen_entity_create(e)) for e in entity_create] + [
-        (lambda e=e: _gen_entity_update(e)) for e in entity_update
-    ]
+        entity_factories = [(lambda e=e: _gen_entity_note_create(e)) for e in entity_create] + [
+            (lambda e=e: _gen_entity_note_update(e)) for e in entity_update
+        ]
+    else:
+        entity_tasks.extend(asyncio.create_task(_gen_entity_create(e)) for e in entity_create)
+        entity_tasks.extend(asyncio.create_task(_gen_entity_update(e)) for e in entity_update)
+
+        entity_factories = [(lambda e=e: _gen_entity_create(e)) for e in entity_create] + [
+            (lambda e=e: _gen_entity_update(e)) for e in entity_update
+        ]
 
     concept_names: list[str] = []
     concept_briefs_map: dict[str, str] = {}
@@ -2376,7 +2532,12 @@ async def _compile_concepts(
             )
         safe = _sanitize_concept_name(name)
         is_update = (wiki_dir / "entities" / f"{safe}.md").exists()
-        _write_entity(wiki_dir, name, cleaned, source_file, is_update, brief=brief, type_=etype)
+        if concept_update_mode == "append":
+            compiler_notes.append_entity_note(
+                wiki_dir, name, cleaned, source_file, doc_name, description=brief, type_=etype
+            )
+        else:
+            _write_entity(wiki_dir, name, cleaned, source_file, is_update, brief=brief, type_=etype)
         entity_names.append(safe)
         entity_meta[safe] = (etype, brief)
 
@@ -2467,14 +2628,19 @@ async def _compile_concepts(
 
     # --- Write concept pages to disk ---
     for name, page_content, is_update, brief in pending_writes:
-        _write_concept(
-            wiki_dir,
-            name,
-            page_content,
-            source_file,
-            is_update,
-            brief=brief,
-        )
+        if concept_update_mode == "append":
+            compiler_notes.append_concept_note(
+                wiki_dir, name, page_content, source_file, doc_name, description=brief
+            )
+        else:
+            _write_concept(
+                wiki_dir,
+                name,
+                page_content,
+                source_file,
+                is_update,
+                brief=brief,
+            )
 
     # --- Step 3b: Process related items (code only, no LLM) ---
     sanitized_related = [_sanitize_concept_name(s) for s in related_items]
@@ -2540,7 +2706,11 @@ async def compile_short_doc(
     Step 1: Build base context A (schema + doc content), generate summary.
     Steps 2-4: Delegated to ``_compile_concepts``.
     """
-    from openkb.config import resolve_effective_config, resolve_insert_mode
+    from openkb.config import (
+        resolve_concept_update_mode,
+        resolve_effective_config,
+        resolve_insert_mode,
+    )
 
     config = resolve_effective_config(kb_dir)[0]
     language: str = config.get("language", "en")
@@ -2606,6 +2776,7 @@ async def compile_short_doc(
             doc_type="short",
             rewrite_summary=True,
             entity_types=entity_types,
+            concept_update_mode=resolve_concept_update_mode(config),
             bundle=bundle,
             insert_mode=insert_mode,
         )
@@ -2630,7 +2801,11 @@ async def compile_long_doc(
     The summary page is already written by the indexer. This function
     generates concept pages and updates the index.
     """
-    from openkb.config import resolve_effective_config, resolve_insert_mode
+    from openkb.config import (
+        resolve_concept_update_mode,
+        resolve_effective_config,
+        resolve_insert_mode,
+    )
 
     config = resolve_effective_config(kb_dir)[0]
     language: str = config.get("language", "en")
@@ -2692,6 +2867,7 @@ async def compile_long_doc(
             doc_brief=doc_description,
             doc_type="pageindex",
             entity_types=entity_types,
+            concept_update_mode=resolve_concept_update_mode(config),
             bundle=bundle,
             insert_mode=insert_mode,
         )
