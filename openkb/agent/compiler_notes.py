@@ -37,7 +37,7 @@ This concept was just identified in document "{doc_name}" (summarized above).
 
 Return a JSON object with two keys:
 - "description": A single sentence (under 100 chars) defining this concept
-- "note": 1-2 short sentences (or just a few keywords if that's enough) \
+- "note": Some short sentences (or just a few keywords if that's enough) \
 capturing what THIS document says about {title} — it will be appended to a \
 running list of notes, not written as prose. Do NOT use [[wikilinks]].
 
@@ -50,7 +50,7 @@ Concept page: {title}
 Document "{doc_name}" (summarized above) mentions this concept.
 
 Return a JSON object with one key:
-- "note": 1-2 short sentences (or just a few keywords if that's enough) \
+- "note": Some short sentences (or just a few keywords if that's enough) \
 capturing what THIS document adds about {title} — it will be appended to a \
 running list of notes, not merged into the existing page (which you do not \
 see). Do NOT use [[wikilinks]].
@@ -65,7 +65,7 @@ This entity was just identified in document "{doc_name}" (summarized above).
 
 Return a JSON object with two keys:
 - "description": A single sentence (under 100 chars) identifying this entity
-- "note": 1-2 short sentences (or just a few keywords if that's enough) \
+- "note": Some short sentences (or just a few keywords if that's enough) \
 capturing what THIS document says about {title} — it will be appended to a \
 running list of notes, not written as prose. Do NOT use [[wikilinks]].
 
@@ -78,7 +78,7 @@ Entity page: {title} (type: {type})
 Document "{doc_name}" (summarized above) mentions this entity.
 
 Return a JSON object with one key:
-- "note": 1-2 short sentences (or just a few keywords if that's enough) \
+- "note": Some short sentences (or just a few keywords if that's enough) \
 capturing what THIS document adds about {title} — it will be appended to a \
 running list of notes, not merged into the existing page (which you do not \
 see). Do NOT use [[wikilinks]].
