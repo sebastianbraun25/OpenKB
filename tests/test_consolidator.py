@@ -15,13 +15,21 @@ from openkb.agent.consolidator import (
 
 
 def _mock_completion(response: str):
+    """Fake litellm.completion(..., stream=True): a single-chunk stream.
+
+    ``_llm_call`` merges stream chunks via ``_merge_stream_chunks`` — exposing
+    ``.message`` (not ``.delta``) tells it this one chunk IS the final
+    response, mirroring test_compiler.py's ``_mock_response``/``_mock_completion``.
+    """
+
     def side_effect(*args, **kwargs):
         mock_resp = MagicMock()
         mock_resp.choices = [MagicMock()]
         mock_resp.choices[0].message.content = response
+        mock_resp.choices[0].finish_reason = "stop"
         mock_resp.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
         mock_resp.usage.prompt_tokens_details = None
-        return mock_resp
+        return [mock_resp]
 
     return side_effect
 
