@@ -22,6 +22,7 @@ from openkb.config import (
     resolve_litellm_settings,
     resolve_model_settings,
     resolve_parallel_tool_calls,
+    resolve_strict_entity_types,
     resolve_timeout,
     save_config,
     save_global_config,
@@ -183,6 +184,35 @@ def test_concurrency_not_in_default_config():
     # resolve_concurrency reads it via .get(), so an absent key resolves to
     # None without relying on load_config's merge.
     assert "concurrency" not in DEFAULT_CONFIG
+
+
+# --- strict_entity_types -------------------------------------------------------
+
+
+def test_strict_entity_types_default_in_config():
+    assert DEFAULT_CONFIG["strict_entity_types"] is False
+
+
+def test_strict_entity_types_not_in_global_scalar_keys():
+    # KB config.yaml only (like concept_update_mode/debug) — not workbench/
+    # global-editable.
+    assert "strict_entity_types" not in GLOBAL_SCALAR_KEYS
+
+
+def test_resolve_strict_entity_types_absent_is_default():
+    assert resolve_strict_entity_types({}) is False
+
+
+def test_resolve_strict_entity_types_valid_values():
+    assert resolve_strict_entity_types({"strict_entity_types": True}) is True
+    assert resolve_strict_entity_types({"strict_entity_types": False}) is False
+
+
+def test_resolve_strict_entity_types_rejects_non_bool(caplog):
+    with caplog.at_level(logging.WARNING, logger="openkb.config"):
+        result = resolve_strict_entity_types({"strict_entity_types": "yes"})
+    assert result is False
+    assert "strict_entity_types" in caplog.text
 
 
 def test_load_concurrency_override(tmp_path):

@@ -37,6 +37,13 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 #   - dataset
 #   - model
 
+# Optional: reject an entity whose LLM-returned type doesn't match
+# entity_types (above) instead of coercing it to "other". Off by default
+# (backward compatible); turn on for a narrow, domain-specific entity_types
+# list where an "other"-typed entity usually signals a bad/too-specific
+# candidate you'd rather drop than keep.
+# strict_entity_types: false
+
 # Optional: how concept/entity pages absorb new documents on `openkb add`.
 #   rewrite   default — send the existing page's full body to the LLM and
 #             let it rewrite the whole page to incorporate the new document.
