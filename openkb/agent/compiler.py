@@ -39,6 +39,7 @@ from openkb.config import (
 )
 from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
 from openkb.locks import atomic_write_text
+from openkb.pending import MAX_NOTES_BEFORE_PROMOTION, PendingTopicsStore
 from openkb.schema import INDEX_SEED, get_agents_md
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,14 @@ Return ONLY valid JSON, no fences.
 _ENTITY_TYPE_LIST = DEFAULT_ENTITY_TYPES
 _ENTITY_TYPES = frozenset(_ENTITY_TYPE_LIST)
 
+# Hard cap on words in a brand-new concept/entity name (see _count_words) and
+# the token-density constant used to compute the soft per-document "how many
+# brand-new items" guidance substituted into __DOC_TOKEN_GUIDANCE__. Both are
+# intentionally NOT config keys (see issue #247) — the only new config-driven
+# knob in this feature is strict_entity_types.
+_MAX_NAME_WORDS = 3
+_TOKENS_PER_NEW_ITEM = 1000
+
 
 _CONCEPTS_PLAN_USER = """\
 Based on the summary above, decide how to update the wiki's CONCEPT pages and
@@ -116,11 +125,20 @@ add a "type" field, one of: __ENTITY_TYPES__. Example:
    {{"name": "anthropic", "title": "Anthropic", "type": "organization"}}
 
 Rules:
-- For the first few documents, create 2-3 foundational concepts at most.
+- Most of your proposals should be "update" or "related" against the
+  existing pages listed above — reuse and cross-link what's already there
+  rather than fragmenting knowledge into new pages. Only propose "create" for
+  a topic that clearly doesn't fit anything existing yet.
+- __DOC_TOKEN_GUIDANCE__
+- Concept and entity names must be short and general — at most 3 words.
+  Never use a unique identifier, hash, or ticket/case number as a name, and
+  avoid overly specific combinations (e.g. a person's name plus their role in
+  this one case, or a technology plus one specific incident path). If a
+  candidate doesn't reduce to a short, general, reusable phrase, do not
+  propose it.
 - Create an ENTITY page only when the entity is (a) central to this document
   or (b) likely to recur across sources. Do NOT page proper nouns mentioned
-  only in passing. Roughly 5-15 entities per document is typical; fewer for
-  sparse documents.
+  only in passing.
 - Prefer "update" over "create" for any concept or entity already listed above.
 - Do NOT create a concept/entity that overlaps an existing one — use "update".
 - Do NOT create concepts that are just the document topic itself.
@@ -186,6 +204,7 @@ _ENTITY_PAGE_USER = """\
 Write the entity page for: {title} (type: {type})
 
 This entity relates to the document "{doc_name}" summarized above.
+{update_instruction}
 
 Return a JSON object with three keys:
 - "description": A single sentence (under 100 chars) identifying this entity
@@ -224,6 +243,11 @@ Return ONLY valid JSON, no fences.
 # ``.openkb/config.yaml`` override the default enum everywhere at once. The
 # token is a plain string (not a ``{}`` placeholder) so it does not collide with
 # the ``{{ }}`` JSON braces these templates feed to ``str.format``.
+#
+# ``__DOC_TOKEN_GUIDANCE__`` (in ``_CONCEPTS_PLAN_USER``) is substituted the
+# same way, with a sentence computed from the current document's real token
+# count (see ``_doc_token_guidance``) — a soft, non-enforced suggestion for
+# how many brand-new concepts+entities to propose, never a filter.
 
 _SUMMARY_REWRITE_USER = """\
 Task: Rewrite the summary you wrote above into a final version that is \
@@ -405,9 +429,17 @@ def _llm_call(
     raise_on_truncation: bool = False,
     *,
     bundle=None,
+    capture_usage: dict | None = None,
     **kwargs,
 ) -> str:
-    """Single LLM call with animated progress and debug logging."""
+    """Single LLM call with animated progress and debug logging.
+
+    ``capture_usage``, when given a dict, is populated with
+    ``{"prompt_tokens": ..., "completion_tokens": ...}`` from the response
+    before returning — lets a caller read the real token count of a call
+    (e.g. the summary call) without changing this function's string return
+    type for every other call site.
+    """
     messages = _prepare_messages(model, messages)
     extra_headers = bundle.extra_headers if bundle is not None else get_extra_headers()
     if extra_headers:
@@ -434,6 +466,9 @@ def _llm_call(
     logger.debug(
         "LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else "")
     )
+    if capture_usage is not None:
+        capture_usage["prompt_tokens"] = getattr(response.usage, "prompt_tokens", None)
+        capture_usage["completion_tokens"] = getattr(response.usage, "completion_tokens", None)
     if raise_on_truncation and truncated:
         raise TruncatedResponseError(
             f"LLM [{step_name}] hit the length limit; skipping to avoid a truncated page"
@@ -594,8 +629,54 @@ def _page_fields(raw: str) -> tuple[str, str, dict | None]:
     return obj.get("description", ""), (obj.get("content") or ""), obj
 
 
-def _filter_concept_items(items: list, label: str) -> list[dict]:
-    """Keep only dicts that carry a non-empty ``name``; warn about anything else."""
+_WORD_SPLIT_RE = re.compile(r"[-_\s]+")
+
+
+def _count_words(name: str) -> int:
+    """Count words in a candidate name, splitting on ``-``/``_``/whitespace.
+
+    Used to gate brand-new concept/entity names to a handful of words — a
+    lightweight, deterministic proxy for "too specific to be reusable
+    knowledge" (unique keys, hashes, ticket numbers, and multi-part
+    combinations all tend to produce long names).
+    """
+    return len([w for w in _WORD_SPLIT_RE.split(name.strip()) if w])
+
+
+def _doc_token_guidance(doc_tokens: int | None) -> str:
+    """Build the ``__DOC_TOKEN_GUIDANCE__`` sentence for ``_CONCEPTS_PLAN_USER``.
+
+    Purely a soft, textual suggestion for the LLM — never enforced/filtered
+    in code (see issue #247: "create" volume is only ever nudged via the
+    prompt; reuse/update/promotion of existing or pending topics is never
+    capped). ``suggested_cap`` uses ``_TOKENS_PER_NEW_ITEM`` as a single
+    internal constant for both the flat floor (short documents) and the
+    divisor (longer documents). Falls back to a generic sentence without
+    numbers when ``doc_tokens`` couldn't be determined (e.g. the usage object
+    was missing for a non-standard provider).
+    """
+    if not doc_tokens or doc_tokens <= 0:
+        return (
+            "As a rough guideline, propose only a handful of brand-new "
+            "concepts and entities combined for this document — reuse/update "
+            "existing pages for everything else."
+        )
+    suggested_cap = 3 if doc_tokens < _TOKENS_PER_NEW_ITEM else doc_tokens // _TOKENS_PER_NEW_ITEM
+    return (
+        f"This document is approximately {doc_tokens} tokens long. As a rough "
+        f"guideline, propose at most {suggested_cap} brand-new concepts and "
+        "entities combined for this document."
+    )
+
+
+def _filter_concept_items(items: list, label: str, *, max_words: int | None = None) -> list[dict]:
+    """Keep only dicts that carry a non-empty ``name``; warn about anything else.
+
+    ``max_words``, when given, additionally drops names with more words (see
+    :func:`_count_words`) than that. Pass ``None`` (the default; used for
+    "update" items, which target an already-existing, already-vetted name) to
+    skip this check.
+    """
     if not isinstance(items, list):
         logger.warning(
             "concepts plan: %s was %s, expected list — dropping", label, type(items).__name__
@@ -619,6 +700,17 @@ def _filter_concept_items(items: list, label: str) -> list[dict]:
             label,
             ", ".join(sorted(set(reasons))),
         )
+    if max_words is not None:
+        too_long = [c for c in valid if _count_words(c["name"]) > max_words]
+        if too_long:
+            logger.info(
+                "concepts plan: dropped %d %s item(s) with names over %d words: %s",
+                len(too_long),
+                label,
+                max_words,
+                [c["name"] for c in too_long][:5],
+            )
+        valid = [c for c in valid if _count_words(c["name"]) <= max_words]
     return valid
 
 
@@ -648,7 +740,13 @@ def _filter_related_slugs(items: list) -> list[str]:
     return valid
 
 
-def _filter_entity_items(items: object, valid_types: frozenset | None = None) -> list[dict]:
+def _filter_entity_items(
+    items: object,
+    valid_types: frozenset | None = None,
+    *,
+    strict: bool = False,
+    max_words: int | None = None,
+) -> list[dict]:
     """Validate entity create/update objects: require name+title, coerce type.
 
     Each kept item is normalized to ``{"name", "title", "type"}`` where
@@ -656,32 +754,67 @@ def _filter_entity_items(items: object, valid_types: frozenset | None = None) ->
     and ``title`` falls back to ``name``. ``valid_types`` defaults to the
     module-level ``_ENTITY_TYPES`` so callers that don't thread a config-driven
     set keep today's behavior.
+
+    ``strict`` (see ``config.resolve_strict_entity_types``), when ``True``,
+    drops an item whose type falls outside ``valid_types`` instead of coercing
+    it to ``"other"``. ``max_words`` (see :func:`_count_words`), when given,
+    drops names with more words than that. Both default to today's lenient
+    behavior (``False``/``None``); pass them only for "create" items — an
+    "update" targets an already-existing, already-vetted name/type.
     """
     if valid_types is None:
         valid_types = _ENTITY_TYPES
     out: list[dict] = []
     if not isinstance(items, list):
         return out
+    dropped_strict = 0
+    dropped_words = 0
     for it in items:
         if not isinstance(it, dict):
             continue
         name = it.get("name")
         if not isinstance(name, str) or not name.strip():
             continue
+        if max_words is not None and _count_words(name) > max_words:
+            dropped_words += 1
+            continue
         title = it.get("title") if isinstance(it.get("title"), str) else name
         etype = it.get("type")
         if not isinstance(etype, str) or etype not in valid_types:
+            if strict:
+                dropped_strict += 1
+                continue
             etype = "other"
         out.append({"name": name, "title": title, "type": etype})
+    if dropped_strict:
+        logger.info(
+            "concepts plan: dropped %d entity item(s) with type outside the configured "
+            "entity_types (strict_entity_types=true)",
+            dropped_strict,
+        )
+    if dropped_words:
+        logger.info(
+            "concepts plan: dropped %d entity item(s) with names over %d words",
+            dropped_words,
+            max_words,
+        )
     return out
 
 
-def _parse_entities_plan(parsed: object, valid_types: frozenset | None = None) -> dict:
+def _parse_entities_plan(
+    parsed: object,
+    valid_types: frozenset | None = None,
+    *,
+    strict: bool = False,
+    max_words: int | None = None,
+) -> dict:
     """Extract the entities group from a plan dict, with graceful fallback.
 
     Returns ``{"create": [...], "update": [...], "related": [...]}``. A
     missing/malformed ``entities`` key yields empty lists, so older or
-    partial LLM responses never raise.
+    partial LLM responses never raise. ``strict``/``max_words`` (see
+    :func:`_filter_entity_items`) are applied to "create" only — an "update"
+    targets an already-existing, already-vetted name/type.
     """
     empty = {"create": [], "update": [], "related": []}
     if not isinstance(parsed, dict):
@@ -690,7 +823,9 @@ def _parse_entities_plan(parsed: object, valid_types: frozenset | None = None) -
     if not isinstance(group, dict):
         return empty
     return {
-        "create": _filter_entity_items(group.get("create", []), valid_types),
+        "create": _filter_entity_items(
+            group.get("create", []), valid_types, strict=strict, max_words=max_words
+        ),
         "update": _filter_entity_items(group.get("update", []), valid_types),
         "related": _filter_related_slugs(group.get("related", [])),
     }
@@ -788,6 +923,21 @@ def _read_entity_briefs(wiki_dir: Path) -> str:
         lines.append(f"- {path.stem} ({etype}, {n_sources} sources){suffix}")
 
     return "\n".join(lines) or "(none yet)"
+
+
+def _combine_briefs(existing_briefs: str, pending_store: "PendingTopicsStore", kind: str) -> str:
+    """Append pending-topic brief lines (see ``openkb.pending``) to the
+    existing-page briefs fed to the plan call, so the LLM treats a pending
+    topic like a quasi-existing page for dedup ("prefer update"/"related"
+    over proposing a near-duplicate create). Pending slugs are NOT added to
+    the wikilink whitelist elsewhere — no real page exists for them yet.
+    """
+    pending_lines = pending_store.brief_lines(kind)
+    if not pending_lines:
+        return existing_briefs
+    if existing_briefs == "(none yet)":
+        return "\n".join(pending_lines)
+    return existing_briefs + "\n" + "\n".join(pending_lines)
 
 
 def _iter_h2_headings(lines: list[str]) -> list[tuple[int, str]]:
@@ -1618,6 +1768,8 @@ async def _compile_concepts(
     rewrite_summary: bool = False,
     entity_types: list[str] | None = None,
     concept_update_mode: str = "rewrite",
+    strict_entity_types: bool = False,
+    doc_tokens: int | None = None,
     bundle=None,
 ) -> None:
     """Shared Steps 2-4: concepts plan → generate/update → index.
@@ -1647,8 +1799,11 @@ async def _compile_concepts(
     valid_types = frozenset(entity_types)
 
     # --- Step 2: Get concepts plan (A cached) ---
-    concept_briefs = _read_concept_briefs(wiki_dir)
-    entity_briefs = _read_entity_briefs(wiki_dir)
+    # Pending-topics buffer (issue #247): instantiated once here and reused
+    # below (repartition + task-building) — see PendingTopicsStore docstring.
+    pending_store = PendingTopicsStore(kb_dir / ".openkb" / "pending_topics.json")
+    concept_briefs = _combine_briefs(_read_concept_briefs(wiki_dir), pending_store, "concepts")
+    entity_briefs = _combine_briefs(_read_entity_briefs(wiki_dir), pending_store, "entities")
 
     # Second cache breakpoint: end of the assistant summary message. Covers
     # (system + doc + summary) for the plan call and every concept call.
@@ -1665,7 +1820,9 @@ async def _compile_concepts(
                 "content": _CONCEPTS_PLAN_USER.format(
                     concept_briefs=concept_briefs,
                     entity_briefs=entity_briefs,
-                ).replace("__ENTITY_TYPES__", types_str),
+                )
+                .replace("__ENTITY_TYPES__", types_str)
+                .replace("__DOC_TOKEN_GUIDANCE__", _doc_token_guidance(doc_tokens)),
             },
         ],
         "concepts-plan",
@@ -1735,18 +1892,26 @@ async def _compile_concepts(
         return
 
     if isinstance(parsed, list):
-        plan = {"create": _filter_concept_items(parsed, "list"), "update": [], "related": []}
+        plan = {
+            "create": _filter_concept_items(parsed, "list", max_words=_MAX_NAME_WORDS),
+            "update": [],
+            "related": [],
+        }
         entities_plan = {"create": [], "update": [], "related": []}
     else:
         concepts_group = (
             parsed.get("concepts") if isinstance(parsed.get("concepts"), dict) else parsed
         )
         plan = {
-            "create": _filter_concept_items(concepts_group.get("create", []), "create"),
+            "create": _filter_concept_items(
+                concepts_group.get("create", []), "create", max_words=_MAX_NAME_WORDS
+            ),
             "update": _filter_concept_items(concepts_group.get("update", []), "update"),
             "related": _filter_related_slugs(concepts_group.get("related", [])),
         }
-        entities_plan = _parse_entities_plan(parsed, valid_types)
+        entities_plan = _parse_entities_plan(
+            parsed, valid_types, strict=strict_entity_types, max_words=_MAX_NAME_WORDS
+        )
 
     create_items = plan["create"]
     update_items = plan["update"]
@@ -1773,6 +1938,52 @@ async def _compile_concepts(
         if (wiki_dir / "entities" / f"{_sanitize_concept_name(s)}.md").exists()
     ]
 
+    # --- Ebene 3 (issue #247): route any candidate without a REAL page yet
+    # through the pending-topics buffer instead of an instant create. Routing
+    # is by actual disk state, not the LLM's create/update label — a pending
+    # topic is only visible to the LLM as brief text (see below), so it
+    # doesn't reliably know whether to call it "create" or "update". A
+    # candidate that already has a real page keeps today's exact behavior
+    # (normal update path); "create" itself never writes a page directly
+    # anymore — it always goes through the buffer first.
+    def _has_real_page(dirpath: Path, name: str) -> bool:
+        return (dirpath / f"{_sanitize_concept_name(name)}.md").exists()
+
+    concepts_dir = wiki_dir / "concepts"
+    entities_dir = wiki_dir / "entities"
+
+    concept_candidates = create_items + update_items
+    update_items = [c for c in concept_candidates if _has_real_page(concepts_dir, c["name"])]
+    pending_concept_candidates = [
+        c for c in concept_candidates if not _has_real_page(concepts_dir, c["name"])
+    ]
+    create_items = []
+
+    entity_candidates = entity_create + entity_update
+    entity_update = [e for e in entity_candidates if _has_real_page(entities_dir, e["name"])]
+    pending_entity_candidates = [
+        e for e in entity_candidates if not _has_real_page(entities_dir, e["name"])
+    ]
+    entity_create = []
+
+    # Only candidates whose buffer ALREADY holds MAX_NOTES_BEFORE_PROMOTION
+    # notes will promote to a real page this round (this document's mention
+    # is their 3rd) — those need to be in the wikilink whitelist below; a
+    # still-buffering candidate (1st/2nd mention) must NOT be, since no page
+    # will exist for it yet.
+    pending_concept_promote = [
+        c
+        for c in pending_concept_candidates
+        if pending_store.note_count("concepts", _sanitize_concept_name(c["name"]))
+        >= MAX_NOTES_BEFORE_PROMOTION
+    ]
+    pending_entity_promote = [
+        e
+        for e in pending_entity_candidates
+        if pending_store.note_count("entities", _sanitize_concept_name(e["name"]))
+        >= MAX_NOTES_BEFORE_PROMOTION
+    ]
+
     # Distinguish "filters dropped everything" from "LLM emitted an empty plan".
     # Count entity items too, so a plan that emitted only entities — all of
     # which were dropped as malformed — still surfaces the warning.
@@ -1789,12 +2000,12 @@ async def _compile_concepts(
     else:
         original_total = _raw_group_count(concepts_group) + _raw_group_count(parsed.get("entities"))
     post_filter_total = (
-        len(create_items)
-        + len(update_items)
+        len(update_items)
         + len(related_items)
-        + len(entity_create)
         + len(entity_update)
         + len(entity_related)
+        + len(pending_concept_candidates)
+        + len(pending_entity_candidates)
     )
     if original_total > 0 and post_filter_total == 0:
         sys.stdout.write(
@@ -1804,12 +2015,12 @@ async def _compile_concepts(
         sys.stdout.flush()
 
     if (
-        not create_items
-        and not update_items
+        not update_items
         and not related_items
-        and not entity_create
         and not entity_update
         and not entity_related
+        and not pending_concept_candidates
+        and not pending_entity_candidates
     ):
         if rewrite_summary:
             _write_v1_summary_stripped()
@@ -1818,14 +2029,16 @@ async def _compile_concepts(
 
     # Build the whitelist of valid wikilink targets the LLM may emit. It
     # combines what already exists on disk with what *this* round will
-    # produce (plan.create + plan.update + plan.related), plus the
-    # summary about to be written for this document.
-    planned_slugs = {_sanitize_concept_name(c["name"]) for c in create_items + update_items} | {
-        _sanitize_concept_name(s) for s in related_items
-    }
-    entity_planned = {_sanitize_concept_name(e["name"]) for e in entity_create + entity_update} | {
-        _sanitize_concept_name(s) for s in entity_related
-    }
+    # produce (plan.update + plan.related + any pending topic about to be
+    # promoted), plus the summary about to be written for this document.
+    # Still-buffering pending topics are deliberately excluded — no page
+    # will exist for them yet.
+    planned_slugs = {
+        _sanitize_concept_name(c["name"]) for c in update_items + pending_concept_promote
+    } | {_sanitize_concept_name(s) for s in related_items}
+    entity_planned = {
+        _sanitize_concept_name(e["name"]) for e in entity_update + pending_entity_promote
+    } | {_sanitize_concept_name(s) for s in entity_related}
     known_targets: set[str] = (
         list_existing_wiki_targets(wiki_dir)
         | {f"concepts/{s}" for s in planned_slugs}
@@ -1855,7 +2068,7 @@ async def _compile_concepts(
     # --- Step 3: Generate/update concept pages concurrently (A cached) ---
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    async def _gen_create(concept: dict) -> tuple[str, str, bool, str]:
+    async def _gen_create(concept: dict, extra_context: str = "") -> tuple[str, str, bool, str]:
         name = concept["name"]
         title = concept.get("title", name)
         async with semaphore:
@@ -1871,7 +2084,7 @@ async def _compile_concepts(
                         "content": _CONCEPT_PAGE_USER.format(
                             title=title,
                             doc_name=doc_name,
-                            update_instruction="",
+                            update_instruction=extra_context,
                         ),
                     },
                 ],
@@ -1918,7 +2131,7 @@ async def _compile_concepts(
         _require_nonempty_content(content, name)
         return name, content, True, brief
 
-    async def _gen_entity_create(ent: dict) -> tuple[str, str, str, str]:
+    async def _gen_entity_create(ent: dict, extra_context: str = "") -> tuple[str, str, str, str]:
         name = ent["name"]
         title = ent.get("title", name)
         etype = ent.get("type", "other")
@@ -1936,6 +2149,7 @@ async def _compile_concepts(
                             title=title,
                             type=etype,
                             doc_name=doc_name,
+                            update_instruction=extra_context,
                         ).replace("__ENTITY_TYPES__", types_str),
                     },
                 ],
@@ -2101,7 +2315,147 @@ async def _compile_concepts(
         _require_nonempty_content(note, name)
         return name, note, "", etype
 
+    async def _gen_pending_concept(concept: dict) -> tuple[str, str] | None:
+        """Buffer a note for a concept with no real page yet, or promote it
+        to a real page on its 3rd mention (see openkb.pending). Returns
+        ``None`` for a buffer-only step (nothing written); returns
+        ``(safe_name, brief)`` for a promotion — the page is already written
+        directly (with all buffered sources) by this function, so the caller
+        only needs the slug/brief to register it for backlinking/index
+        update, same as a normal create.
+        """
+        name = concept["name"]
+        title = concept.get("title", name)
+        slug = _sanitize_concept_name(name)
+        async with semaphore:
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    {
+                        "role": "user",
+                        "content": compiler_notes._CONCEPT_NOTE_CREATE_USER.format(
+                            title=title, doc_name=doc_name
+                        ),
+                    },
+                ],
+                f"concept-note: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+        brief, note = compiler_notes.note_fields(raw)
+        _require_nonempty_content(note, name)
+        new_count = pending_store.add_note("concepts", slug, title, doc_name, source_file, note)
+        if new_count <= MAX_NOTES_BEFORE_PROMOTION:
+            return  # still buffering — no page yet
+        entry = pending_store.get("concepts", slug)
+        prior_notes = entry["notes"][:-1] if entry else []
+        pending_store.remove("concepts", slug)
+        if concept_update_mode == "append":
+            for n in prior_notes:
+                compiler_notes.append_concept_note(
+                    wiki_dir, name, n["note"], n["source_file"], n["doc_name"], description=brief
+                )
+            compiler_notes.append_concept_note(
+                wiki_dir, name, note, source_file, doc_name, description=brief
+            )
+            return
+        notes_ctx = "\n".join(f"- ({n['doc_name']}) {n['note']}" for n in prior_notes)
+        extra_context = f"Earlier notes about this topic from prior documents:\n{notes_ctx}"
+        _, content, _, brief2 = await _gen_create(concept, extra_context=extra_context)
+        cleaned, ghosts = strip_ghost_wikilinks(content, known_targets)
+        if ghosts:
+            logger.info(
+                "stripped %d ghost wikilink(s) from promoted concept %s: %s",
+                len(ghosts),
+                name,
+                ghosts[:5],
+            )
+        _write_concept(wiki_dir, name, cleaned, source_file, False, brief=brief2)
+        path = (wiki_dir / "concepts" / f"{slug}.md").resolve()
+        existing = path.read_text(encoding="utf-8")
+        for n in prior_notes:
+            existing = _prepend_source_to_frontmatter(existing, n["source_file"])
+        atomic_write_text(path, existing)
+        return slug, brief2
+
+    async def _gen_pending_entity(ent: dict) -> tuple[str, str, str] | None:
+        """Entity counterpart of :func:`_gen_pending_concept` — see there.
+        Returns ``(safe_name, brief, type)`` on promotion, else ``None``.
+        """
+        name = ent["name"]
+        title = ent.get("title", name)
+        etype = ent.get("type", "other")
+        slug = _sanitize_concept_name(name)
+        async with semaphore:
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    {
+                        "role": "user",
+                        "content": compiler_notes._ENTITY_NOTE_CREATE_USER.format(
+                            title=title, type=etype, doc_name=doc_name
+                        ),
+                    },
+                ],
+                f"entity-note: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+        brief, note = compiler_notes.note_fields(raw)
+        _require_nonempty_content(note, name)
+        new_count = pending_store.add_note(
+            "entities", slug, title, doc_name, source_file, note, type_=etype
+        )
+        if new_count <= MAX_NOTES_BEFORE_PROMOTION:
+            return  # still buffering — no page yet
+        entry = pending_store.get("entities", slug)
+        prior_notes = entry["notes"][:-1] if entry else []
+        pending_store.remove("entities", slug)
+        if concept_update_mode == "append":
+            for n in prior_notes:
+                compiler_notes.append_entity_note(
+                    wiki_dir,
+                    name,
+                    n["note"],
+                    n["source_file"],
+                    n["doc_name"],
+                    description=brief,
+                    type_=etype,
+                )
+            compiler_notes.append_entity_note(
+                wiki_dir, name, note, source_file, doc_name, description=brief, type_=etype
+            )
+            return
+        notes_ctx = "\n".join(f"- ({n['doc_name']}) {n['note']}" for n in prior_notes)
+        extra_context = f"Earlier notes about this topic from prior documents:\n{notes_ctx}"
+        _, content, brief2, etype_out = await _gen_entity_create(ent, extra_context=extra_context)
+        cleaned, ghosts = strip_ghost_wikilinks(content, known_targets)
+        if ghosts:
+            logger.info(
+                "stripped %d ghost wikilink(s) from promoted entity %s: %s",
+                len(ghosts),
+                name,
+                ghosts[:5],
+            )
+        _write_entity(wiki_dir, name, cleaned, source_file, False, brief=brief2, type_=etype_out)
+        path = (wiki_dir / "entities" / f"{slug}.md").resolve()
+        existing = path.read_text(encoding="utf-8")
+        for n in prior_notes:
+            existing = _prepend_source_to_frontmatter(existing, n["source_file"])
+        atomic_write_text(path, existing)
+        return slug, brief2, etype_out
+
     tasks = []
+    # Pending-buffer tasks scheduled first (mirrors the old "create tasks come
+    # before update tasks" ordering: create_items is always empty now, so a
+    # brand-new topic's task is this one instead).
+    tasks.extend(_gen_pending_concept(c) for c in pending_concept_candidates)
     if concept_update_mode == "append":
         tasks.extend(_gen_note_create(c) for c in create_items)
         tasks.extend(_gen_note_update(c) for c in update_items)
@@ -2114,6 +2468,7 @@ async def _compile_concepts(
     # return 4-arity tuples (name, content, brief, type), so their results are
     # processed in their own loop rather than mixed with the concept tuples.
     entity_tasks = []
+    entity_tasks.extend(_gen_pending_entity(e) for e in pending_entity_candidates)
     if concept_update_mode == "append":
         entity_tasks.extend(_gen_entity_note_create(e) for e in entity_create)
         entity_tasks.extend(_gen_entity_note_update(e) for e in entity_update)
@@ -2151,10 +2506,28 @@ async def _compile_concepts(
 
     if tasks:
         failure_types: list[str] = []
+        self_handled = 0
         for r in results:
             if isinstance(r, Exception):
                 logger.warning("Concept generation failed: %s", r)
                 failure_types.append(type(r).__name__)
+                continue
+            if r is None:
+                # Pending-buffer step (openkb.pending): a still-buffering note
+                # or a promotion that already wrote its own page directly —
+                # neither is a failure, and neither has anything left to do
+                # in pending_writes below.
+                self_handled += 1
+                continue
+            if len(r) == 2:
+                # Promoted via the pending buffer (openkb.pending): the page
+                # is already written directly — just register it for
+                # backlinking/whitelist/index like a normal create.
+                safe_name, brief = r
+                concept_names.append(safe_name)
+                if brief:
+                    concept_briefs_map[safe_name] = brief
+                self_handled += 1
                 continue
             name, page_content, is_update, brief = r
             pending_writes.append((name, page_content, is_update, brief))
@@ -2166,7 +2539,7 @@ async def _compile_concepts(
         # Include exception type names inline so the stdout line is
         # self-contained — per-failure WARNINGs go to stderr.
         written = len(pending_writes)
-        if written < total:
+        if written + self_handled < total:
             reason = ", ".join(sorted(set(failure_types))) if failure_types else "see log (stderr)"
             sys.stdout.write(
                 f"    [WARN] {total} concept(s) planned but only {written} written "
@@ -2176,16 +2549,30 @@ async def _compile_concepts(
 
     if entity_tasks:
         entity_failure_types: list[str] = []
+        entity_self_handled = 0
         for r in entity_results:
             if isinstance(r, Exception):
                 logger.warning("Entity generation failed: %s", r)
                 entity_failure_types.append(type(r).__name__)
                 continue
+            if r is None:
+                # Pending-buffer step (openkb.pending) — see the concept loop
+                # above for why this isn't a failure.
+                entity_self_handled += 1
+                continue
+            if len(r) == 3:
+                # Promoted via the pending buffer (openkb.pending) — see the
+                # concept loop above.
+                safe_name, brief, etype = r
+                entity_names.append(safe_name)
+                entity_meta[safe_name] = (etype, brief)
+                entity_self_handled += 1
+                continue
             name, page_content, brief, etype = r
             entity_pending.append((name, page_content, brief, etype))
 
         ewritten = len(entity_pending)
-        if ewritten < etotal:
+        if ewritten + entity_self_handled < etotal:
             reason = (
                 ", ".join(sorted(set(entity_failure_types)))
                 if entity_failure_types
@@ -2371,7 +2758,11 @@ async def compile_short_doc(
     Step 1: Build base context A (schema + doc content), generate summary.
     Steps 2-4: Delegated to ``_compile_concepts``.
     """
-    from openkb.config import resolve_concept_update_mode, resolve_effective_config
+    from openkb.config import (
+        resolve_concept_update_mode,
+        resolve_effective_config,
+        resolve_strict_entity_types,
+    )
 
     config = resolve_effective_config(kb_dir)[0]
     language: str = config.get("language", "en")
@@ -2406,13 +2797,16 @@ async def compile_short_doc(
     # for the plan + concept-generation calls, then rewritten into a final
     # v2 (with a whitelist of known wikilink targets) inside
     # _compile_concepts before being written to disk.
+    summary_usage: dict = {}
     summary_raw = _llm_call(
         model,
         [system_msg, doc_msg],
         "summary",
         response_format=_JSON_RESPONSE_FORMAT,
         bundle=bundle,
+        capture_usage=summary_usage,
     )
+    doc_tokens = summary_usage.get("prompt_tokens")
     try:
         summary_parsed = _parse_json(summary_raw)
         doc_brief = summary_parsed.get("description", "")
@@ -2437,6 +2831,8 @@ async def compile_short_doc(
             rewrite_summary=True,
             entity_types=entity_types,
             concept_update_mode=resolve_concept_update_mode(config),
+            strict_entity_types=resolve_strict_entity_types(config),
+            doc_tokens=doc_tokens,
             bundle=bundle,
         )
     finally:
@@ -2460,7 +2856,11 @@ async def compile_long_doc(
     The summary page is already written by the indexer. This function
     generates concept pages and updates the index.
     """
-    from openkb.config import resolve_concept_update_mode, resolve_effective_config
+    from openkb.config import (
+        resolve_concept_update_mode,
+        resolve_effective_config,
+        resolve_strict_entity_types,
+    )
 
     config = resolve_effective_config(kb_dir)[0]
     language: str = config.get("language", "en")
@@ -2505,7 +2905,15 @@ async def compile_long_doc(
     }
 
     # --- Step 1: Generate overview ---
-    overview = _llm_call(model, [system_msg, doc_msg], "overview", bundle=bundle)
+    # doc_tokens here approximates the tokens of the PageIndex SUMMARY fed to
+    # this call, not the original long document (which is never sent whole
+    # to a single call) — an accepted approximation for the token-density
+    # guidance substituted into __DOC_TOKEN_GUIDANCE__.
+    overview_usage: dict = {}
+    overview = _llm_call(
+        model, [system_msg, doc_msg], "overview", bundle=bundle, capture_usage=overview_usage
+    )
+    doc_tokens = overview_usage.get("prompt_tokens")
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     try:
@@ -2522,6 +2930,8 @@ async def compile_long_doc(
             doc_type="pageindex",
             entity_types=entity_types,
             concept_update_mode=resolve_concept_update_mode(config),
+            strict_entity_types=resolve_strict_entity_types(config),
+            doc_tokens=doc_tokens,
             bundle=bundle,
         )
     finally:

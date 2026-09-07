@@ -40,6 +40,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # resolve_concept_update_mode(). KB config.yaml only (like `debug`), not
     # in GLOBAL_SCALAR_KEYS.
     "concept_update_mode": "rewrite",
+    # Opt-in gate for `entity_types:` — see resolve_strict_entity_types(). KB
+    # config.yaml only, not in GLOBAL_SCALAR_KEYS (same treatment as
+    # concept_update_mode above).
+    "strict_entity_types": False,
 }
 
 VALID_CONCEPT_UPDATE_MODES: tuple[str, ...] = ("rewrite", "append")
@@ -160,6 +164,25 @@ def resolve_concept_update_mode(config: dict) -> str:
             value,
         )
         return "rewrite"
+    return value
+
+
+def resolve_strict_entity_types(config: dict) -> bool:
+    """Resolve ``strict_entity_types:`` — ``False`` by default.
+
+    When ``True``, an entity whose LLM-returned ``type`` doesn't match the
+    configured :func:`resolve_entity_types` vocabulary is dropped instead of
+    being coerced to ``"other"``. A non-bool value degrades to ``False`` with
+    a warning (matches :func:`resolve_concept_update_mode`'s degrade-on-
+    malformed-value behavior).
+    """
+    value = config.get("strict_entity_types", False)
+    if not isinstance(value, bool):
+        logger.warning(
+            "config: 'strict_entity_types' must be a bool, got %r — using False.",
+            value,
+        )
+        return False
     return value
 
 
