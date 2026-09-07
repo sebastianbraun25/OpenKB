@@ -2252,6 +2252,28 @@ class TestRemoveEntityPages:
         assert "See also" not in shared
         assert "summaries/other" in shared
 
+    def test_strips_append_mode_note_line_keeps_other_notes(self, tmp_path):
+        # A "concept_update_mode=append" page (compiler_notes.append_entity_note)
+        # keeps its notes under "## Notes", one dated line per source doc.
+        # Removing one doc must strip only ITS line, not the whole section.
+        ent = tmp_path / "entities"
+        ent.mkdir()
+        (ent / "shared.md").write_text(
+            "---\ntype: organization\nsources: [summaries/doc.md, summaries/other.md]\n---\n\n"
+            "## Notes\n\n"
+            "- **2026-09-07** Mentioned in doc. ([[summaries/doc]])\n"
+            "- **2026-09-01** Mentioned in other. ([[summaries/other]])\n",
+            encoding="utf-8",
+        )
+        result = remove_doc_from_entity_pages(tmp_path, "doc")
+        assert result == {"modified": ["shared"], "deleted": []}
+        shared = (ent / "shared.md").read_text(encoding="utf-8")
+        assert "summaries/doc" not in shared
+        assert "Mentioned in doc." not in shared
+        assert "## Notes" in shared
+        assert "Mentioned in other." in shared
+        assert "summaries/other" in shared
+
 
 class TestCompileEntitiesEndToEnd:
     @pytest.mark.asyncio
