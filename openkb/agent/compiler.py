@@ -2118,27 +2118,6 @@ async def _compile_concepts(
     # (system + doc + summary) for the plan call and every concept call.
     summary_msg = {"role": "assistant", "content": _cached_text(summary)}
 
-    plan_raw = _llm_call(
-        model,
-        [
-            system_msg,
-            doc_msg,
-            summary_msg,
-            {
-                "role": "user",
-                "content": _CONCEPTS_PLAN_USER.format(
-                    concept_briefs=concept_briefs,
-                    entity_briefs=entity_briefs,
-                )
-                .replace("__ENTITY_TYPES__", types_str)
-                .replace("__DOC_TOKEN_GUIDANCE__", _doc_token_guidance(doc_tokens)),
-            },
-        ],
-        "concepts-plan",
-        response_format=_JSON_RESPONSE_FORMAT,
-        bundle=bundle,
-    )
-
     def _write_v1_summary_stripped() -> None:
         """Fallback writer for the v1 summary on early-return paths.
 
@@ -2159,6 +2138,42 @@ async def _compile_concepts(
                 ghosts[:5],
             )
         _write_summary(wiki_dir, doc_name, cleaned, description=doc_brief)
+
+    try:
+        plan_raw = _llm_call(
+            model,
+            [
+                system_msg,
+                doc_msg,
+                summary_msg,
+                {
+                    "role": "user",
+                    "content": _CONCEPTS_PLAN_USER.format(
+                        concept_briefs=concept_briefs,
+                        entity_briefs=entity_briefs,
+                    )
+                    .replace("__ENTITY_TYPES__", types_str)
+                    .replace("__DOC_TOKEN_GUIDANCE__", _doc_token_guidance(doc_tokens)),
+                },
+            ],
+            "concepts-plan",
+            response_format=_JSON_RESPONSE_FORMAT,
+            bundle=bundle,
+        )
+    except _NON_RETRYABLE_LLM_ERRORS as exc:
+        # The existing concept/entity index grows with the KB (see
+        # _read_concept_briefs/_read_entity_briefs) and is added on top of the
+        # already-cached document — a doc that was fine for the summary call
+        # can still blow the window here once the index gets large enough.
+        # The summary itself already exists (unlike the doc-too-large case
+        # above), so it's kept — same fallback as an unparseable/empty plan,
+        # just skipping concept/entity generation for this doc.
+        logger.warning("Skipping concept/entity extraction for %s: %s", doc_name, exc)
+        _maybe_raise_incomplete("concepts plan request exceeded the model's context window")
+        if rewrite_summary:
+            _write_v1_summary_stripped()
+        _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
+        return
 
     try:
         parsed = _parse_json(plan_raw)
