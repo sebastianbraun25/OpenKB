@@ -163,14 +163,17 @@ def _build_index_config(config: dict[str, Any], bundle=None) -> IndexConfig:
     working against a pinned PageIndex that predates it (``IndexConfig``
     forbids unknown kwargs).
 
-    ``bundle``'s ``api_key``/``base_url`` (the same credentials ``compiler.py``'s
-    own LLM calls use — see :func:`openkb.config.resolve_credential_bundle`) are
-    forwarded as PageIndex's own per-call ``llm_params`` (see #219): without
-    this, PageIndex's internal indexing calls (TOC/tree/summary generation)
-    fall back to LiteLLM's default provider-key/env-var lookup, which doesn't
-    know about a KB's custom ``LLM_API_KEY``/gateway ``base_url``. Guarded by
-    the same ``model_fields`` check as ``max_concurrency`` above, so it
-    degrades gracefully against an older pinned PageIndex.
+    ``bundle``'s ``api_key``/``base_url``/``extra_headers``/``timeout`` (the
+    same credentials ``compiler.py``'s own LLM calls use — see
+    :func:`openkb.config.resolve_credential_bundle`) are forwarded as
+    PageIndex's own per-call ``llm_params`` (see #219): without this,
+    PageIndex's internal indexing calls (TOC/tree/summary generation) fall
+    back to LiteLLM's default provider-key/env-var lookup, which doesn't know
+    about a KB's custom ``LLM_API_KEY``/gateway ``base_url`` — or, for
+    gateways authenticated purely via a header (e.g. an ``Authorization:
+    Bearer`` proxy token in ``litellm.extra_headers``), has no credentials at
+    all. Guarded by the same ``model_fields`` check as ``max_concurrency``
+    above, so it degrades gracefully against an older pinned PageIndex.
     """
     kwargs: dict[str, Any] = {
         "if_add_node_text": True,
@@ -189,8 +192,13 @@ def _build_index_config(config: dict[str, Any], bundle=None) -> IndexConfig:
     if bundle is not None:
         llm_params = {
             key: value
-            for key, value in {"api_key": bundle.api_key, "base_url": bundle.base_url}.items()
-            if value
+            for key, value in {
+                "api_key": bundle.api_key,
+                "base_url": bundle.base_url,
+                "extra_headers": bundle.extra_headers,
+                "timeout": bundle.timeout,
+            }.items()
+            if value or (key == "timeout" and value is not None)
         }
         if llm_params:
             if "llm_params" in IndexConfig.model_fields:
