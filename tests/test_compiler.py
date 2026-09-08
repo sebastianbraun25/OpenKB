@@ -1798,6 +1798,11 @@ class TestOversizedDocumentSkip:
         assert "too large" in text.lower()
         assert not list((wiki / "concepts").glob("*.md"))
 
+        # The stub must still get the usual index.md "## Documents" entry —
+        # otherwise it's an undiscoverable orphan (openkb lint's index-sync check).
+        index_text = (wiki / "index.md").read_text()
+        assert "[[summaries/doc]]" in index_text
+
     @pytest.mark.asyncio
     async def test_writes_stub_when_summary_call_raises_context_window_exceeded(self, tmp_path):
         wiki, source_path = TestCompileShortDocFallbacks._setup_kb(tmp_path)
@@ -1823,6 +1828,9 @@ class TestOversizedDocumentSkip:
         text = summary_path.read_text()
         assert "too large" in text.lower()
         assert not list((wiki / "concepts").glob("*.md"))
+
+        index_text = (wiki / "index.md").read_text()
+        assert "[[summaries/doc]]" in index_text
 
 
 class TestMaxInputTokens:
