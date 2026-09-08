@@ -1503,6 +1503,53 @@ class TestCompileShortDocFallbacks:
         # No concept pages produced from the unusable plan.
         assert not list((wiki / "concepts").glob("*.md"))
 
+    @pytest.mark.asyncio
+    async def test_concepts_plan_context_window_exceeded_keeps_real_summary(self, tmp_path):
+        """The summary call already succeeded with real content by the time
+        concepts-plan runs (unlike TestOversizedDocumentSkip, where the doc
+        itself is too large) — this must NOT be replaced with a generic
+        "too large" stub. Same fallback as an unparseable/empty plan: keep
+        the real v1 summary (ghost-stripped), index it, skip concept/entity
+        generation for this doc."""
+        wiki, source_path = self._setup_kb(tmp_path)
+
+        v1_summary_content = "# Summary\n\nDiscusses [[concepts/nonexistent]] here."
+        summary_response = json.dumps(
+            {"description": "A real summary", "content": v1_summary_content}
+        )
+        error = litellm.ContextWindowExceededError(
+            message="prompt is too long: 220670 tokens > 200000 maximum",
+            model="claude-sonnet-4-5",
+            llm_provider="anthropic",
+        )
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                return [_mock_response(summary_response)]
+            raise error
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=side_effect)
+            # Must not raise out of compile_short_doc.
+            await compile_short_doc("doc", source_path, tmp_path, "claude-sonnet-4-5")
+            # summary + concepts-plan, no wasted retries on the doomed request.
+            assert mock_litellm.completion.call_count == 2
+
+        summary_path = wiki / "summaries" / "doc.md"
+        assert summary_path.exists()
+        text = summary_path.read_text()
+        assert "Discusses" in text  # real summary content kept, not a stub
+        assert "too large" not in text.lower()
+        assert "[[concepts/nonexistent]]" not in text  # ghost link stripped
+        assert "nonexistent" in text  # display text preserved
+
+        index_text = (wiki / "index.md").read_text()
+        assert "[[summaries/doc]]" in index_text
+        assert not list((wiki / "concepts").glob("*.md"))
+
 
 class TestOversizedDocumentSkip:
     """A document whose content can't fit an LLM call is treated like an
