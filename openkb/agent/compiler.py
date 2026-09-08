@@ -422,6 +422,33 @@ class TruncatedResponseError(Exception):
     treat truncation as a failure (so a partial page is skipped, not written)."""
 
 
+# Exceptions that are guaranteed to fail again on an identical retry (e.g. a
+# prompt that already exceeds the model's context window) — retrying wastes
+# whole attempts (and, for a stream, the connection time to discover the
+# failure again) for zero chance of success.
+_NON_RETRYABLE_LLM_ERRORS: tuple[type[Exception], ...] = (litellm.ContextWindowExceededError,)
+
+
+def _max_input_tokens(model: str) -> int | None:
+    """Best-effort context-window lookup for ``model``; ``None`` if unknown.
+
+    Used only to skip a call that's already known to be doomed before it's
+    even sent — never to second-guess a model litellm/the provider doesn't
+    also recognize, so an unmapped model just disables the preflight check.
+    """
+    try:
+        max_input_tokens = litellm.get_model_info(model).get("max_input_tokens")
+    except Exception:
+        return None
+    return int(max_input_tokens) if isinstance(max_input_tokens, int | float) else None
+
+
+# Reserved headroom (completion + rough token-counting slack) subtracted from
+# a model's context window before comparing it to the prompt's token count —
+# a prompt that just barely fits leaves no room for the model to respond.
+_CONTEXT_WINDOW_HEADROOM_TOKENS = 4096
+
+
 def _merge_stream_chunks(chunks: list, messages: list[dict]):
     """Merge streamed LLM chunks back into a single, non-streaming response.
 
@@ -620,7 +647,7 @@ def _llm_call(
             response = _merge_stream_chunks(chunks, messages)
             break
         except Exception as exc:
-            if attempt == attempts - 1:
+            if attempt == attempts - 1 or isinstance(exc, _NON_RETRYABLE_LLM_ERRORS):
                 spinner.stop("failed")
                 raise
             logger.warning(
@@ -695,7 +722,7 @@ async def _llm_call_async(
             response = _merge_stream_chunks(chunks, messages)
             break
         except Exception as exc:
-            if attempt == attempts - 1:
+            if attempt == attempts - 1 or isinstance(exc, _NON_RETRYABLE_LLM_ERRORS):
                 raise
             logger.warning(
                 "LLM [%s] attempt %d/%d failed: %s; retrying...",
@@ -1307,6 +1334,30 @@ def _write_summary(
     fm_lines.append(_yaml_kv_line("full_text", f"sources/{doc_name}.{ext}"))
     fm_block = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
     atomic_write_text(summaries_dir / f"{doc_name}.md", fm_block + summary)
+
+
+def _write_unprocessable_stub(wiki_dir: Path, doc_name: str, reason: str) -> None:
+    """Write a placeholder summary for a doc whose content can't be fed to the LLM.
+
+    Mirrors how an unreadable/undecodable image is handled: the source stays
+    in the knowledge base as a plain reference instead of aborting the whole
+    ``add`` or discarding it, but it's skipped for LLM ingestion entirely (no
+    summary/concept/entity generation), since a request this size is either
+    already known to exceed the model's context window or has just failed
+    with ``litellm.ContextWindowExceededError``.
+    """
+    body = (
+        "This document was not processed by the LLM: its content is too "
+        f"large for the model's context window ({reason}). The raw source "
+        "is still kept in the knowledge base for reference, but no summary "
+        "or concept/entity extraction was generated for it."
+    )
+    _write_summary(
+        wiki_dir,
+        doc_name,
+        body,
+        description="Not processed by the LLM \u2014 content too large for the context window.",
+    )
 
 
 _SAFE_NAME_RE = re.compile(r"[^\w\-]")
@@ -3163,20 +3214,51 @@ async def compile_short_doc(
         ),
     }
 
+    # Preflight: skip the LLM entirely for a doc that's already known to
+    # exceed the model's context window (only when the model is recognized —
+    # see _max_input_tokens) instead of sending a request that's certain to
+    # fail. The doc stays in the KB as a plain reference, like an unreadable
+    # image would.
+    max_input_tokens = _max_input_tokens(model)
+    if max_input_tokens is not None:
+        prompt_tokens = litellm.token_counter(model=model, messages=[system_msg, doc_msg])
+        if prompt_tokens > max_input_tokens - _CONTEXT_WINDOW_HEADROOM_TOKENS:
+            logger.warning(
+                "Skipping LLM ingestion for %s: %d prompt tokens > %s's %d-token context window",
+                doc_name,
+                prompt_tokens,
+                model,
+                max_input_tokens,
+            )
+            _write_unprocessable_stub(
+                wiki_dir,
+                doc_name,
+                f"{prompt_tokens} tokens > {model}'s {max_input_tokens}-token context window",
+            )
+            return
+
     # --- Step 1: Generate summary (v1, held in memory) ---
     # The summary is NOT written to disk yet — it's used as cache context
     # for the plan + concept-generation calls, then rewritten into a final
     # v2 (with a whitelist of known wikilink targets) inside
     # _compile_concepts before being written to disk.
     summary_usage: dict = {}
-    summary_raw = _llm_call(
-        model,
-        [system_msg, doc_msg],
-        "summary",
-        response_format=_JSON_RESPONSE_FORMAT,
-        bundle=bundle,
-        capture_usage=summary_usage,
-    )
+    try:
+        summary_raw = _llm_call(
+            model,
+            [system_msg, doc_msg],
+            "summary",
+            response_format=_JSON_RESPONSE_FORMAT,
+            bundle=bundle,
+            capture_usage=summary_usage,
+        )
+    except _NON_RETRYABLE_LLM_ERRORS as exc:
+        # The preflight check above is best-effort (unmapped model, or
+        # litellm's token_counter estimate came in under the real one) — this
+        # is the safety net for when it still slips through.
+        logger.warning("Skipping LLM ingestion for %s: %s", doc_name, exc)
+        _write_unprocessable_stub(wiki_dir, doc_name, str(exc))
+        return
     doc_tokens = summary_usage.get("prompt_tokens")
     try:
         summary_parsed = _parse_json(summary_raw)

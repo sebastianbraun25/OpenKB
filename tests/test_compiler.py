@@ -6,6 +6,7 @@ import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
 
 from openkb.agent.compiler import (
@@ -1771,6 +1772,110 @@ class TestCompileShortDocFallbacks:
         assert "[[summaries/doc]]" in index_text
         # No concept pages produced from the unusable plan.
         assert not list((wiki / "concepts").glob("*.md"))
+
+
+class TestOversizedDocumentSkip:
+    """A document whose content can't fit an LLM call is treated like an
+    unreadable image: kept in the KB as a plain reference, but skipped for
+    LLM ingestion entirely rather than aborting the whole ``add`` or wasting
+    retries on a request that's guaranteed to fail again (#<TODO>)."""
+
+    @pytest.mark.asyncio
+    async def test_skips_llm_call_when_preflight_detects_oversized_prompt(self, tmp_path):
+        wiki, source_path = TestCompileShortDocFallbacks._setup_kb(tmp_path)
+
+        with (
+            patch("openkb.agent.compiler._max_input_tokens", return_value=1000),
+            patch("openkb.agent.compiler.litellm") as mock_litellm,
+        ):
+            mock_litellm.token_counter = MagicMock(return_value=999_999)
+            await compile_short_doc("doc", source_path, tmp_path, "gpt-4o-mini")
+            mock_litellm.completion.assert_not_called()
+
+        summary_path = wiki / "summaries" / "doc.md"
+        assert summary_path.exists()
+        text = summary_path.read_text()
+        assert "too large" in text.lower()
+        assert not list((wiki / "concepts").glob("*.md"))
+
+    @pytest.mark.asyncio
+    async def test_writes_stub_when_summary_call_raises_context_window_exceeded(self, tmp_path):
+        wiki, source_path = TestCompileShortDocFallbacks._setup_kb(tmp_path)
+
+        error = litellm.ContextWindowExceededError(
+            message="prompt is too long: 569887 tokens > 200000 maximum",
+            model="claude-sonnet-4-5",
+            llm_provider="anthropic",
+        )
+        with (
+            patch("openkb.agent.compiler._Spinner", _NoOpSpinner),
+            patch("openkb.agent.compiler.litellm") as mock_litellm,
+        ):
+            mock_litellm.completion = MagicMock(side_effect=error)
+            # Must not raise out of compile_short_doc.
+            await compile_short_doc("doc", source_path, tmp_path, "claude-sonnet-4-5")
+            # Only the summary call was attempted — no retries wasted on a
+            # deterministically doomed request, no concept-plan call either.
+            assert mock_litellm.completion.call_count == 1
+
+        summary_path = wiki / "summaries" / "doc.md"
+        assert summary_path.exists()
+        text = summary_path.read_text()
+        assert "too large" in text.lower()
+        assert not list((wiki / "concepts").glob("*.md"))
+
+
+class TestMaxInputTokens:
+    """``_max_input_tokens`` must only ever be a best-effort hint: an
+    unrecognized model disables the preflight check instead of guessing."""
+
+    def test_known_model_returns_context_window(self):
+        from openkb.agent.compiler import _max_input_tokens
+
+        assert _max_input_tokens("claude-sonnet-4-5") == 200_000
+
+    def test_unknown_model_returns_none(self):
+        from openkb.agent.compiler import _max_input_tokens
+
+        assert _max_input_tokens("totally-unknown-model-xyz") is None
+
+
+class TestNonRetryableLLMErrors:
+    """litellm.ContextWindowExceededError means the exact same request will
+    fail again — retrying it just burns the fixed 3-attempt resilience floor
+    on a request that can never succeed."""
+
+    def test_llm_call_does_not_retry_context_window_exceeded(self):
+        from openkb.agent.compiler import _llm_call
+
+        error = litellm.ContextWindowExceededError(
+            message="prompt is too long: 569887 tokens > 200000 maximum",
+            model="m",
+            llm_provider="anthropic",
+        )
+        with (
+            patch("openkb.agent.compiler._Spinner", _NoOpSpinner),
+            patch("openkb.agent.compiler.litellm") as mock_litellm,
+        ):
+            mock_litellm.completion = MagicMock(side_effect=error)
+            with pytest.raises(litellm.ContextWindowExceededError):
+                _llm_call("m", [{"role": "user", "content": "hi"}], "step")
+            assert mock_litellm.completion.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_llm_call_async_does_not_retry_context_window_exceeded(self):
+        from openkb.agent.compiler import _llm_call_async
+
+        error = litellm.ContextWindowExceededError(
+            message="prompt is too long: 569887 tokens > 200000 maximum",
+            model="m",
+            llm_provider="anthropic",
+        )
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(side_effect=error)
+            with pytest.raises(litellm.ContextWindowExceededError):
+                await _llm_call_async("m", [{"role": "user", "content": "hi"}], "step")
+            assert mock_litellm.acompletion.call_count == 1
 
 
 class TestCacheControl:
