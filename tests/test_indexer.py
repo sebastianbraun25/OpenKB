@@ -99,15 +99,18 @@ class TestBuildIndexConfig:
 
 
 class _FakeBundle:
-    def __init__(self, api_key=None, base_url=None):
+    def __init__(self, api_key=None, base_url=None, extra_headers=None, timeout=None):
         self.api_key = api_key
         self.base_url = base_url
+        self.extra_headers = extra_headers or {}
+        self.timeout = timeout
 
 
 class TestBuildIndexConfigLlmParams:
-    """``bundle``'s api_key/base_url must reach PageIndex's own LLM calls via
-    ``IndexConfig(llm_params=...)`` (#219) — without this they silently fall
-    back to LiteLLM's default provider-key/env-var lookup."""
+    """``bundle``'s api_key/base_url/extra_headers/timeout must reach PageIndex's
+    own LLM calls via ``IndexConfig(llm_params=...)`` (#219) — without this they
+    silently fall back to LiteLLM's default provider-key/env-var lookup (or, for
+    header-only gateway auth, have no credentials at all)."""
 
     def test_forwards_api_key_and_base_url_when_supported(self, monkeypatch):
         monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithConcurrency)
@@ -137,6 +140,35 @@ class TestBuildIndexConfigLlmParams:
             cfg = _build_index_config({}, bundle)
         assert not hasattr(cfg, "llm_params")
         assert "llm_params" in caplog.text
+
+    def test_forwards_extra_headers_and_timeout_when_supported(self, monkeypatch):
+        monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithConcurrency)
+        bundle = _FakeBundle(extra_headers={"Authorization": "Bearer proxy-token"}, timeout=30.0)
+        cfg = _build_index_config({}, bundle)
+        assert cfg.llm_params == {
+            "extra_headers": {"Authorization": "Bearer proxy-token"},
+            "timeout": 30.0,
+        }
+
+    def test_empty_extra_headers_is_not_forwarded(self, monkeypatch):
+        monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithConcurrency)
+        cfg = _build_index_config({}, _FakeBundle(extra_headers={}))
+        assert not hasattr(cfg, "llm_params")
+
+    def test_zero_timeout_is_forwarded(self, monkeypatch):
+        # timeout=0 is falsy but a deliberately-set value — must not be filtered
+        # out the same way an unset (None) timeout is.
+        monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithConcurrency)
+        cfg = _build_index_config({}, _FakeBundle(timeout=0))
+        assert cfg.llm_params == {"timeout": 0}
+
+    def test_header_only_gateway_auth_is_forwarded_without_api_key(self, monkeypatch):
+        # Regression: proxy/gateway setups that authenticate purely via a
+        # header (no LLM_API_KEY) must still reach PageIndex's LLM calls.
+        monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithConcurrency)
+        bundle = _FakeBundle(extra_headers={"Authorization": "Bearer proxy-token"})
+        cfg = _build_index_config({}, bundle)
+        assert cfg.llm_params == {"extra_headers": {"Authorization": "Bearer proxy-token"}}
 
 
 class TestClosePageindexClient:
