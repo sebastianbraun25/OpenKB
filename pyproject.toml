@@ -33,7 +33,10 @@ keywords = ["ai", "rag", "retrieval", "knowledge-base", "llm", "pageindex", "age
 # auto-injects GitHub Copilot IDE-auth headers.
 dependencies = [
     "pageindex==0.3.0.dev3",
-    "markitdown[docx,pptx,xlsx,xls]==0.1.5",
+    # 0.1.8b1 (pre-release) fixes microsoft/markitdown#2360: charset guessing
+    # only sampled the first 4KB, misdetecting ASCII for CSV/text files whose
+    # non-ASCII bytes appear later (sample bumped to 64KB upstream).
+    "markitdown[docx,pptx,xlsx,xls]==0.1.8b1",
     "trafilatura==2.0.0",
     "click==8.4.0",
     "watchdog==6.0.0",

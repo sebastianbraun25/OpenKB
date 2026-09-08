@@ -167,6 +167,36 @@ class TestConvertDocumentMarkItDown:
 
 
 # ---------------------------------------------------------------------------
+# convert_document — CSV charset detection (real markitdown, no mocking)
+# ---------------------------------------------------------------------------
+
+
+class TestConvertDocumentCharsetDetection:
+    def test_csv_with_late_non_ascii_bytes_converts_without_unicode_error(self, kb_dir, tmp_path):
+        """Regression for microsoft/markitdown#2360: charset guessing used to
+        sample only the first 4KB of the file, misdetecting ASCII when
+        non-ASCII bytes (e.g. German umlauts) only appear further in. Uses
+        the real markitdown library (no mock) since the fix lives there.
+        """
+        src = tmp_path / "cases.csv"
+        header = "id,description\n"
+        padding_rows = "".join(
+            f"{i},plain ascii row {i} used only as byte padding\n" for i in range(200)
+        )
+        late_row = "9999,Fehler: ung\u00fcltige Daten f\u00fcr den Fall\n"
+        content = header + padding_rows + late_row
+        assert len(content.encode("utf-8")) > 4096  # sanity: umlaut lands past the old 4KB sample
+        src.write_text(content, encoding="utf-8")
+
+        result = convert_document(src, kb_dir)
+
+        assert result.skipped is False
+        assert result.source_path is not None
+        markdown = result.source_path.read_text(encoding="utf-8")
+        assert "ungültige Daten" in markdown
+
+
+# ---------------------------------------------------------------------------
 # Lazy markitdown import (guards the deferred-import optimization)
 # ---------------------------------------------------------------------------
 
