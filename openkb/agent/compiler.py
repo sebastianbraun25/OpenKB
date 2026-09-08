@@ -1181,20 +1181,20 @@ def _write_unprocessable_stub(wiki_dir: Path, doc_name: str, reason: str) -> Non
     ``add`` or discarding it, but it's skipped for LLM ingestion entirely (no
     summary/concept/entity generation), since a request this size is either
     already known to exceed the model's context window or has just failed
-    with ``litellm.ContextWindowExceededError``.
+    with ``litellm.ContextWindowExceededError``. Also adds the usual
+    ``## Documents`` index.md entry (via ``_update_index``, with no concepts)
+    — without it the summary page would be an undiscoverable orphan, which
+    ``openkb lint`` flags as an index-sync error.
     """
+    description = "Not processed by the LLM \u2014 content too large for the context window."
     body = (
         "This document was not processed by the LLM: its content is too "
         f"large for the model's context window ({reason}). The raw source "
         "is still kept in the knowledge base for reference, but no summary "
         "or concept/entity extraction was generated for it."
     )
-    _write_summary(
-        wiki_dir,
-        doc_name,
-        body,
-        description="Not processed by the LLM \u2014 content too large for the context window.",
-    )
+    _write_summary(wiki_dir, doc_name, body, description=description)
+    _update_index(wiki_dir, doc_name, [], doc_brief=description)
 
 
 _SAFE_NAME_RE = re.compile(r"[^\w\-]")
