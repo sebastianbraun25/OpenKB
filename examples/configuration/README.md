@@ -99,7 +99,10 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 # entity_types (above) instead of coercing it to "other". Off by default
 # (backward compatible); turn on for a narrow, domain-specific entity_types
 # list where an "other"-typed entity usually signals a bad/too-specific
-# candidate you'd rather drop than keep.
+# candidate you'd rather drop than keep. Also enables a name-length gate:
+# a brand-new entity name longer than 3 words is dropped too (concepts
+# always enforce this cap; entities only opt in together with this flag).
+# Drops are logged as warnings, never silent.
 # strict_entity_types: false
 
 # Optional: LLM / LiteLLM tuning. Keys are forwarded to LiteLLM; `timeout` and
@@ -121,7 +124,7 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 | `concurrency` | `null` | Caps concurrent LLM calls OpenKB makes during ingest — both PageIndex's indexing of a long document and OpenKB's own concept/entity compilation. The two never run at once for the same document, so one setting covers both. Lower it if you hit provider rate limits or "too many open files" on large PDFs. `null` lets each stage apply its own default. |
 | `parallel_tool_calls` | unset | Whether the LLM agents (query, chat, lint, skill) may call tools in parallel. Unset keeps OpenKB's per-agent defaults; `true`/`false` force allow/sequential for every agent; `null` omits the setting (provider default). **Amazon Bedrock needs `null`** (see below). |
 | `entity_types` | 7 defaults | Custom vocabulary for entity pages. `other` is always kept. |
-| `strict_entity_types` | `false` | When `true`, drops an entity whose type doesn't match `entity_types` instead of coercing it to `other`. |
+| `strict_entity_types` | `false` | When `true`, drops an entity whose type doesn't match `entity_types` instead of coercing it to `other`, and also drops a brand-new entity name longer than 3 words (concepts always enforce the name-length cap; entities only opt in together with this flag). Drops are logged as warnings, never silent. |
 | `litellm:` | – | A pass-through block for LiteLLM. See below. |
 
 ### The `litellm:` block

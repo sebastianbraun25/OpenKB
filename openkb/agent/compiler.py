@@ -92,7 +92,11 @@ _ENTITY_TYPES = frozenset(_ENTITY_TYPE_LIST)
 # the token-density constant used to compute the soft per-document "how many
 # brand-new items" guidance substituted into __DOC_TOKEN_GUIDANCE__. Both are
 # intentionally NOT config keys (see issue #247) — the only new config-driven
-# knob in this feature is strict_entity_types.
+# knob in this feature is strict_entity_types. Concepts always enforce this
+# cap; entities only enforce it when strict_entity_types=true (see
+# _filter_entity_items) — it opts into the same "reject, don't coerce" spirit
+# as the type check, so leaving strict_entity_types off keeps entity name
+# length unrestricted, matching pre-issue-#247 behavior exactly.
 _MAX_NAME_WORDS = 3
 _TOKENS_PER_NEW_ITEM = 1000
 
@@ -757,46 +761,52 @@ def _filter_entity_items(
 
     ``strict`` (see ``config.resolve_strict_entity_types``), when ``True``,
     drops an item whose type falls outside ``valid_types`` instead of coercing
-    it to ``"other"``. ``max_words`` (see :func:`_count_words`), when given,
-    drops names with more words than that. Both default to today's lenient
-    behavior (``False``/``None``); pass them only for "create" items — an
-    "update" targets an already-existing, already-vetted name/type.
+    it to ``"other"``, and additionally enables the ``max_words`` (see
+    :func:`_count_words`) name-length gate — both checks are opt-in together,
+    so leaving ``strict_entity_types`` at its default keeps today's lenient
+    behavior (no type drop, no length drop) exactly. Pass ``max_words`` only
+    for "create" items — an "update" targets an already-existing,
+    already-vetted name/type. Drops are logged at warning level (visible
+    without ``-v``) with a sample of the affected names, never silently.
     """
     if valid_types is None:
         valid_types = _ENTITY_TYPES
     out: list[dict] = []
     if not isinstance(items, list):
         return out
-    dropped_strict = 0
-    dropped_words = 0
+    dropped_strict: list[str] = []
+    dropped_words: list[str] = []
     for it in items:
         if not isinstance(it, dict):
             continue
         name = it.get("name")
         if not isinstance(name, str) or not name.strip():
             continue
-        if max_words is not None and _count_words(name) > max_words:
-            dropped_words += 1
+        if strict and max_words is not None and _count_words(name) > max_words:
+            dropped_words.append(name)
             continue
         title = it.get("title") if isinstance(it.get("title"), str) else name
         etype = it.get("type")
         if not isinstance(etype, str) or etype not in valid_types:
             if strict:
-                dropped_strict += 1
+                dropped_strict.append(name)
                 continue
             etype = "other"
         out.append({"name": name, "title": title, "type": etype})
     if dropped_strict:
-        logger.info(
+        logger.warning(
             "concepts plan: dropped %d entity item(s) with type outside the configured "
-            "entity_types (strict_entity_types=true)",
-            dropped_strict,
+            "entity_types (strict_entity_types=true): %s",
+            len(dropped_strict),
+            dropped_strict[:5],
         )
     if dropped_words:
-        logger.info(
-            "concepts plan: dropped %d entity item(s) with names over %d words",
-            dropped_words,
+        logger.warning(
+            "concepts plan: dropped %d entity item(s) with names over %d words "
+            "(strict_entity_types=true): %s",
+            len(dropped_words),
             max_words,
+            dropped_words[:5],
         )
     return out
 
@@ -813,7 +823,8 @@ def _parse_entities_plan(
     Returns ``{"create": [...], "update": [...], "related": [...]}``. A
     missing/malformed ``entities`` key yields empty lists, so older or
     partial LLM responses never raise. ``strict``/``max_words`` (see
-    :func:`_filter_entity_items`) are applied to "create" only — an "update"
+    :func:`_filter_entity_items` — the name-length gate only applies when
+    ``strict`` is ``True``) are applied to "create" only — an "update"
     targets an already-existing, already-vetted name/type.
     """
     empty = {"create": [], "update": [], "related": []}
