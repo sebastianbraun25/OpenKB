@@ -199,10 +199,10 @@ class TestFilterEntityItemsCustomTypes:
         assert out[0]["type"] == "organization"
 
 
-class TestStrictEntityTypes:
-    """strict_entity_types=true (see openkb.config.resolve_strict_entity_types
-    / issue #247): a type outside the configured vocabulary drops the item
-    entirely instead of coercing it to "other"."""
+class TestStrictItemMode:
+    """strict_item_mode=true (see openkb.config.resolve_strict_item_mode /
+    issue #247 follow-up): a type outside the configured vocabulary drops
+    the entity item entirely instead of coercing it to "other"."""
 
     def test_strict_false_still_coerces_to_other(self):
         valid = frozenset({"person", "dataset", "other"})
@@ -226,9 +226,9 @@ class TestStrictEntityTypes:
 class TestMaxWordsFilter:
     """Hard cap on brand-new concept/entity names to 3 words (see
     compiler._count_words / issue #247) — a lightweight proxy for "too
-    specific to be reusable knowledge". Concepts always enforce this cap;
-    entities only enforce it when strict=True (opt-in together with
-    strict_entity_types, see issue #247 follow-up)."""
+    specific to be reusable knowledge". Both concepts and entities only
+    enforce it when strict=True (opt-in together with strict_item_mode,
+    see issue #247 follow-up)."""
 
     def test_count_words_splits_on_hyphen_underscore_and_space(self):
         assert _count_words("attention") == 1
@@ -237,18 +237,39 @@ class TestMaxWordsFilter:
         assert _count_words("some_snake_case_name") == 4
         assert _count_words("a name with spaces") == 4
 
-    def test_concept_items_over_limit_are_dropped(self):
+    def test_concept_items_over_limit_are_dropped_when_strict(self):
         items = [
             {"name": "attention", "title": "Attention"},
             {"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas"},
         ]
-        out = _filter_concept_items(items, "create", max_words=3)
+        out = _filter_concept_items(items, "create", strict=True, max_words=3)
         assert [c["name"] for c in out] == ["attention"]
+
+    def test_concept_items_over_limit_kept_when_not_strict(self):
+        # The word-length gate is opt-in together with strict_item_mode —
+        # passing max_words alone must not drop anything unless strict=True
+        # is also set.
+        items = [
+            {"name": "attention", "title": "Attention"},
+            {"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas"},
+        ]
+        out = _filter_concept_items(items, "create", strict=False, max_words=3)
+        assert [c["name"] for c in out] == ["attention", "andreas-mueller-alwart-ssmpa-2573"]
 
     def test_concept_items_without_max_words_are_unaffected(self):
         items = [{"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas"}]
-        out = _filter_concept_items(items, "update")
+        out = _filter_concept_items(items, "update", strict=True)
         assert len(out) == 1
+
+    def test_dropped_concept_items_are_logged_at_warning_not_silently(self, caplog):
+        import logging
+
+        items = [{"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas"}]
+        with caplog.at_level(logging.WARNING, logger="openkb.agent.compiler"):
+            out = _filter_concept_items(items, "create", strict=True, max_words=3)
+        assert out == []
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("over 3 words" in m for m in messages)
 
     def test_entity_items_over_limit_are_dropped_when_strict(self):
         items = [
@@ -259,9 +280,9 @@ class TestMaxWordsFilter:
         assert [e["name"] for e in out] == ["nvidia"]
 
     def test_entity_items_over_limit_kept_when_not_strict(self):
-        # The word-length gate is opt-in together with strict_entity_types
-        # (see issue #247 follow-up) — passing max_words alone must not drop
-        # anything unless strict=True is also set.
+        # The word-length gate is opt-in together with strict_item_mode —
+        # passing max_words alone must not drop anything unless strict=True
+        # is also set.
         items = [
             {"name": "nvidia", "title": "NVIDIA", "type": "organization"},
             {"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas", "type": "person"},
@@ -333,7 +354,7 @@ class TestParseEntitiesPlanStrictAndMaxWords:
         assert out["update"][0]["type"] == "other"  # coerced, not strict-dropped
 
     def test_create_max_words_ignored_without_strict(self):
-        # The name-length gate is opt-in together with strict_entity_types —
+        # The name-length gate is opt-in together with strict_item_mode —
         # passing max_words without strict=True must not drop long names.
         valid = frozenset({"person", "other"})
         parsed = {

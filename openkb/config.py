@@ -40,10 +40,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # resolve_concept_update_mode(). KB config.yaml only (like `debug`), not
     # in GLOBAL_SCALAR_KEYS.
     "concept_update_mode": "rewrite",
-    # Opt-in gate for `entity_types:` — see resolve_strict_entity_types(). KB
-    # config.yaml only, not in GLOBAL_SCALAR_KEYS (same treatment as
-    # concept_update_mode above).
-    "strict_entity_types": False,
+    # Opt-in strict mode for brand-new concept/entity `create` items — see
+    # resolve_strict_item_mode(). KB config.yaml only, not in
+    # GLOBAL_SCALAR_KEYS (same treatment as concept_update_mode above).
+    "strict_item_mode": False,
 }
 
 VALID_CONCEPT_UPDATE_MODES: tuple[str, ...] = ("rewrite", "append")
@@ -167,22 +167,28 @@ def resolve_concept_update_mode(config: dict) -> str:
     return value
 
 
-def resolve_strict_entity_types(config: dict) -> bool:
-    """Resolve ``strict_entity_types:`` — ``False`` by default.
+def resolve_strict_item_mode(config: dict) -> bool:
+    """Resolve ``strict_item_mode:`` — ``False`` by default.
 
-    When ``True``, an entity whose LLM-returned ``type`` doesn't match the
-    configured :func:`resolve_entity_types` vocabulary is dropped instead of
-    being coerced to ``"other"``, and a brand-new entity name longer than 3
-    words is also dropped (see ``agent.compiler._filter_entity_items`` /
-    ``_MAX_NAME_WORDS``) — both gates are opt-in together. A non-bool value
+    When ``True``, a brand-new concept/entity ``create`` item is dropped
+    instead of kept whenever it looks like a bad/too-specific candidate:
+
+    - a name longer than 3 words is dropped (see
+      ``agent.compiler._filter_concept_items`` / ``_filter_entity_items`` /
+      ``_MAX_NAME_WORDS``) — applies to both concepts and entities.
+    - an entity whose LLM-returned ``type`` doesn't match the configured
+      :func:`resolve_entity_types` vocabulary is dropped instead of being
+      coerced to ``"other"`` — entities only, concepts have no ``type``.
+
+    All gates are opt-in together under this single flag. A non-bool value
     degrades to ``False`` with a warning (matches
     :func:`resolve_concept_update_mode`'s degrade-on-malformed-value
     behavior).
     """
-    value = config.get("strict_entity_types", False)
+    value = config.get("strict_item_mode", False)
     if not isinstance(value, bool):
         logger.warning(
-            "config: 'strict_entity_types' must be a bool, got %r — using False.",
+            "config: 'strict_item_mode' must be a bool, got %r — using False.",
             value,
         )
         return False

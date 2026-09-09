@@ -92,11 +92,12 @@ _ENTITY_TYPES = frozenset(_ENTITY_TYPE_LIST)
 # the token-density constant used to compute the soft per-document "how many
 # brand-new items" guidance substituted into __DOC_TOKEN_GUIDANCE__. Both are
 # intentionally NOT config keys (see issue #247) — the only new config-driven
-# knob in this feature is strict_entity_types. Concepts always enforce this
-# cap; entities only enforce it when strict_entity_types=true (see
-# _filter_entity_items) — it opts into the same "reject, don't coerce" spirit
-# as the type check, so leaving strict_entity_types off keeps entity name
-# length unrestricted, matching pre-issue-#247 behavior exactly.
+# knob in this feature is strict_item_mode. Both concepts and entities only
+# enforce this cap when strict_item_mode=true (see _filter_concept_items /
+# _filter_entity_items) — it opts into a "reject, don't keep" spirit (same
+# as the entity type check), so leaving strict_item_mode off keeps concept
+# and entity name length unrestricted, matching pre-issue-#247 behavior
+# exactly.
 _MAX_NAME_WORDS = 3
 _TOKENS_PER_NEW_ITEM = 1000
 
@@ -673,13 +674,19 @@ def _doc_token_guidance(doc_tokens: int | None) -> str:
     )
 
 
-def _filter_concept_items(items: list, label: str, *, max_words: int | None = None) -> list[dict]:
+def _filter_concept_items(
+    items: list, label: str, *, strict: bool = False, max_words: int | None = None
+) -> list[dict]:
     """Keep only dicts that carry a non-empty ``name``; warn about anything else.
 
-    ``max_words``, when given, additionally drops names with more words (see
-    :func:`_count_words`) than that. Pass ``None`` (the default; used for
-    "update" items, which target an already-existing, already-vetted name) to
-    skip this check.
+    ``strict`` (see ``config.resolve_strict_item_mode``), when ``True``,
+    enables the ``max_words`` (see :func:`_count_words`) name-length gate —
+    a name with more words than that is dropped. Leaving ``strict`` at its
+    default ``False`` keeps names unrestricted in length regardless of
+    ``max_words``. Pass ``max_words`` only for "create" items — an "update"
+    targets an already-existing, already-vetted name. Drops are logged at
+    warning level (visible without ``-v``) with a sample of the affected
+    names, never silently.
     """
     if not isinstance(items, list):
         logger.warning(
@@ -704,11 +711,12 @@ def _filter_concept_items(items: list, label: str, *, max_words: int | None = No
             label,
             ", ".join(sorted(set(reasons))),
         )
-    if max_words is not None:
+    if strict and max_words is not None:
         too_long = [c for c in valid if _count_words(c["name"]) > max_words]
         if too_long:
-            logger.info(
-                "concepts plan: dropped %d %s item(s) with names over %d words: %s",
+            logger.warning(
+                "concepts plan: dropped %d %s item(s) with names over %d words "
+                "(strict_item_mode=true): %s",
                 len(too_long),
                 label,
                 max_words,
@@ -759,11 +767,11 @@ def _filter_entity_items(
     module-level ``_ENTITY_TYPES`` so callers that don't thread a config-driven
     set keep today's behavior.
 
-    ``strict`` (see ``config.resolve_strict_entity_types``), when ``True``,
+    ``strict`` (see ``config.resolve_strict_item_mode``), when ``True``,
     drops an item whose type falls outside ``valid_types`` instead of coercing
     it to ``"other"``, and additionally enables the ``max_words`` (see
     :func:`_count_words`) name-length gate — both checks are opt-in together,
-    so leaving ``strict_entity_types`` at its default keeps today's lenient
+    so leaving ``strict_item_mode`` at its default keeps today's lenient
     behavior (no type drop, no length drop) exactly. Pass ``max_words`` only
     for "create" items — an "update" targets an already-existing,
     already-vetted name/type. Drops are logged at warning level (visible
@@ -796,14 +804,14 @@ def _filter_entity_items(
     if dropped_strict:
         logger.warning(
             "concepts plan: dropped %d entity item(s) with type outside the configured "
-            "entity_types (strict_entity_types=true): %s",
+            "entity_types (strict_item_mode=true): %s",
             len(dropped_strict),
             dropped_strict[:5],
         )
     if dropped_words:
         logger.warning(
             "concepts plan: dropped %d entity item(s) with names over %d words "
-            "(strict_entity_types=true): %s",
+            "(strict_item_mode=true): %s",
             len(dropped_words),
             max_words,
             dropped_words[:5],
@@ -1779,7 +1787,7 @@ async def _compile_concepts(
     rewrite_summary: bool = False,
     entity_types: list[str] | None = None,
     concept_update_mode: str = "rewrite",
-    strict_entity_types: bool = False,
+    strict_item_mode: bool = False,
     doc_tokens: int | None = None,
     bundle=None,
 ) -> None:
@@ -1904,7 +1912,9 @@ async def _compile_concepts(
 
     if isinstance(parsed, list):
         plan = {
-            "create": _filter_concept_items(parsed, "list", max_words=_MAX_NAME_WORDS),
+            "create": _filter_concept_items(
+                parsed, "list", strict=strict_item_mode, max_words=_MAX_NAME_WORDS
+            ),
             "update": [],
             "related": [],
         }
@@ -1915,13 +1925,16 @@ async def _compile_concepts(
         )
         plan = {
             "create": _filter_concept_items(
-                concepts_group.get("create", []), "create", max_words=_MAX_NAME_WORDS
+                concepts_group.get("create", []),
+                "create",
+                strict=strict_item_mode,
+                max_words=_MAX_NAME_WORDS,
             ),
             "update": _filter_concept_items(concepts_group.get("update", []), "update"),
             "related": _filter_related_slugs(concepts_group.get("related", [])),
         }
         entities_plan = _parse_entities_plan(
-            parsed, valid_types, strict=strict_entity_types, max_words=_MAX_NAME_WORDS
+            parsed, valid_types, strict=strict_item_mode, max_words=_MAX_NAME_WORDS
         )
 
     create_items = plan["create"]
@@ -2772,7 +2785,7 @@ async def compile_short_doc(
     from openkb.config import (
         resolve_concept_update_mode,
         resolve_effective_config,
-        resolve_strict_entity_types,
+        resolve_strict_item_mode,
     )
 
     config = resolve_effective_config(kb_dir)[0]
@@ -2842,7 +2855,7 @@ async def compile_short_doc(
             rewrite_summary=True,
             entity_types=entity_types,
             concept_update_mode=resolve_concept_update_mode(config),
-            strict_entity_types=resolve_strict_entity_types(config),
+            strict_item_mode=resolve_strict_item_mode(config),
             doc_tokens=doc_tokens,
             bundle=bundle,
         )
@@ -2870,7 +2883,7 @@ async def compile_long_doc(
     from openkb.config import (
         resolve_concept_update_mode,
         resolve_effective_config,
-        resolve_strict_entity_types,
+        resolve_strict_item_mode,
     )
 
     config = resolve_effective_config(kb_dir)[0]
@@ -2941,7 +2954,7 @@ async def compile_long_doc(
             doc_type="pageindex",
             entity_types=entity_types,
             concept_update_mode=resolve_concept_update_mode(config),
-            strict_entity_types=resolve_strict_entity_types(config),
+            strict_item_mode=resolve_strict_item_mode(config),
             doc_tokens=doc_tokens,
             bundle=bundle,
         )
