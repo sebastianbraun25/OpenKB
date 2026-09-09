@@ -172,9 +172,12 @@ def resolve_strict_entity_types(config: dict) -> bool:
 
     When ``True``, an entity whose LLM-returned ``type`` doesn't match the
     configured :func:`resolve_entity_types` vocabulary is dropped instead of
-    being coerced to ``"other"``. A non-bool value degrades to ``False`` with
-    a warning (matches :func:`resolve_concept_update_mode`'s degrade-on-
-    malformed-value behavior).
+    being coerced to ``"other"``, and a brand-new entity name longer than 3
+    words is also dropped (see ``agent.compiler._filter_entity_items`` /
+    ``_MAX_NAME_WORDS``) — both gates are opt-in together. A non-bool value
+    degrades to ``False`` with a warning (matches
+    :func:`resolve_concept_update_mode`'s degrade-on-malformed-value
+    behavior).
     """
     value = config.get("strict_entity_types", False)
     if not isinstance(value, bool):
