@@ -2367,7 +2367,9 @@ def consolidate(ctx, page_name, all_pages, min_notes, dry_run, yes):
     PAGE_NAME resolves like ``openkb remove`` — exact slug first, else a
     unique substring match across ``wiki/concepts/`` and ``wiki/entities/``.
     ``--all`` consolidates every page with at least ``--min-notes`` pending
-    notes. Exactly one of PAGE_NAME or ``--all`` is required.
+    notes. Exactly one of PAGE_NAME or ``--all`` is required. With ``--all``,
+    pages are consolidated concurrently (bounded by the ``concurrency:``
+    config key, same as concept/entity generation during ingest).
 
     Side effect: this replaces the page's "## Notes" section with prose —
     manual edits inside that section are overwritten. Existing prose above
@@ -2432,22 +2434,27 @@ def consolidate(ctx, page_name, all_pages, min_notes, dry_run, yes):
     config = resolve_effective_config(kb_dir)[0]
     model: str = config.get("model", DEFAULT_CONFIG["model"])
     language: str = config.get("language", "en")
+    max_concurrency = resolve_concurrency(config) or DEFAULT_COMPILE_CONCURRENCY
+
+    total = len(targets)
+    click.echo(f"Consolidating {total} page(s) (concurrency={max_concurrency})...")
+    for page_dir, slug, count in targets:
+        click.echo(f"  - {page_dir}/{slug} ({count} note(s))")
+    results = asyncio.run(
+        consolidator.consolidate_pages(wiki_dir, targets, model, language, max_concurrency)
+    )
 
     consolidated = 0
     skipped = 0
-    total = len(targets)
-    for i, (page_dir, slug, count) in enumerate(targets, 1):
-        click.echo(f"[{i}/{total}] Consolidating {page_dir}/{slug} ({count} note(s))...")
-        start = time.time()
-        try:
-            ok = consolidator.consolidate_page(wiki_dir, page_dir, slug, model, language=language)
-        except Exception as exc:
+    for (page_dir, slug, _count), (ok, exc, elapsed) in zip(targets, results):
+        if exc is not None:
             click.echo(f"  [ERROR] Consolidation failed: {exc}")
-            logging.getLogger(__name__).debug("Consolidate traceback:", exc_info=True)
+            logging.getLogger(__name__).debug(
+                "Consolidate traceback for %s/%s:", page_dir, slug, exc_info=exc
+            )
             skipped += 1
-            continue
-        if ok:
-            click.echo(f"  [OK] {page_dir}/{slug} ({time.time() - start:.1f}s)")
+        elif ok:
+            click.echo(f"  [OK] {page_dir}/{slug} ({elapsed:.1f}s)")
             consolidated += 1
         else:
             click.echo(f"  [SKIP] {page_dir}/{slug} (no pending notes).")
