@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from openkb.agent.consolidator import (
     _split_notes,
@@ -14,8 +16,8 @@ from openkb.agent.consolidator import (
 )
 
 
-def _mock_completion(response: str):
-    def side_effect(*args, **kwargs):
+def _mock_acompletion(response: str):
+    async def side_effect(*args, **kwargs):
         mock_resp = MagicMock()
         mock_resp.choices = [MagicMock()]
         mock_resp.choices[0].message.content = response
@@ -104,15 +106,17 @@ class TestResolvePage:
 
 
 class TestConsolidatePage:
-    def test_returns_false_without_notes_section(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_returns_false_without_notes_section(self, tmp_path):
         wiki = tmp_path / "wiki"
         _write_page(wiki, "concepts", "approval-workflows", '---\nsources: ["a"]\n---\n\nProse.\n')
         with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(side_effect=AssertionError("should not be called"))
-            result = consolidate_page(wiki, "concepts", "approval-workflows", "gpt-4o-mini")
+            mock_litellm.acompletion = AsyncMock(side_effect=AssertionError("should not be called"))
+            result = await consolidate_page(wiki, "concepts", "approval-workflows", "gpt-4o-mini")
         assert result is False
 
-    def test_consolidates_and_replaces_notes_section(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_consolidates_and_replaces_notes_section(self, tmp_path):
         wiki = tmp_path / "wiki"
         _write_page(
             wiki,
@@ -131,8 +135,8 @@ class TestConsolidatePage:
             }
         )
         with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(side_effect=_mock_completion(response))
-            result = consolidate_page(wiki, "concepts", "approval-workflows", "gpt-4o-mini")
+            mock_litellm.acompletion = AsyncMock(side_effect=_mock_acompletion(response))
+            result = await consolidate_page(wiki, "concepts", "approval-workflows", "gpt-4o-mini")
 
         assert result is True
         text = (wiki / "concepts" / "approval-workflows.md").read_text(encoding="utf-8")
@@ -143,7 +147,8 @@ class TestConsolidatePage:
         assert '"summaries/a.md"' in text
         assert '"summaries/b.md"' in text
 
-    def test_strips_ghost_wikilinks_from_consolidated_content(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_strips_ghost_wikilinks_from_consolidated_content(self, tmp_path):
         wiki = tmp_path / "wiki"
         _write_page(
             wiki,
@@ -159,8 +164,8 @@ class TestConsolidatePage:
             }
         )
         with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(side_effect=_mock_completion(response))
-            consolidate_page(wiki, "concepts", "approval-workflows", "gpt-4o-mini")
+            mock_litellm.acompletion = AsyncMock(side_effect=_mock_acompletion(response))
+            await consolidate_page(wiki, "concepts", "approval-workflows", "gpt-4o-mini")
 
         text = (wiki / "concepts" / "approval-workflows.md").read_text(encoding="utf-8")
         assert "[[concepts/nonexistent-page]]" not in text

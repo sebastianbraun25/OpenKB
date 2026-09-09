@@ -14,7 +14,9 @@ consolidation run only ever sees what changed since the last one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from pathlib import Path
 
 from openkb import frontmatter
@@ -145,7 +147,7 @@ def resolve_page(wiki_dir: Path, name: str) -> list[tuple[str, str]]:
     return matches
 
 
-def consolidate_page(
+async def consolidate_page(
     wiki_dir: Path, page_dir: str, slug: str, model: str, language: str = "en"
 ) -> bool:
     """Fold ``page_dir/slug``'s pending notes into curated prose.
@@ -153,7 +155,8 @@ def consolidate_page(
     Returns ``False`` (no-op, no LLM call) when the page has no ``## Notes``
     section. Raises on LLM/parse failure — the CLI command treats a raised
     exception for one page as a per-page failure, not a whole-batch abort
-    (mirrors ``recompile``).
+    (mirrors ``recompile``). Async so the CLI can consolidate several pages
+    concurrently, the same way concept/entity generation does during ingest.
     """
     from openkb.agent import compiler as _compiler
 
@@ -199,7 +202,7 @@ def consolidate_page(
             notes_content=notes_content,
         )
 
-    raw = _compiler._llm_call(
+    raw = await _compiler._llm_call_async(
         model,
         [system_msg, known_targets_msg, {"role": "user", "content": user_content}],
         f"consolidate: {page_dir}/{slug}",
@@ -224,3 +227,33 @@ def consolidate_page(
         fm_block = frontmatter.set_line(fm_block, "description", description)
     atomic_write_text(path, fm_block + "\n" + cleaned)
     return True
+
+
+async def consolidate_pages(
+    wiki_dir: Path,
+    targets: list[tuple[str, str, int]],
+    model: str,
+    language: str,
+    max_concurrency: int,
+) -> list[tuple[bool | None, Exception | None, float]]:
+    """Consolidate several pages concurrently, bounded by ``max_concurrency``.
+
+    Mirrors the concept/entity generation concurrency model used during
+    ingest (``openkb.agent.compiler._compile_concepts``). Returns one
+    ``(ok, error, elapsed_seconds)`` per target, in the same order as
+    ``targets`` regardless of completion order — a per-page exception is
+    captured here rather than propagated, so one page's failure never
+    aborts the batch (mirrors ``recompile``).
+    """
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _run_one(page_dir: str, slug: str) -> tuple[bool | None, Exception | None, float]:
+        start = time.time()
+        async with semaphore:
+            try:
+                ok = await consolidate_page(wiki_dir, page_dir, slug, model, language=language)
+            except Exception as exc:
+                return None, exc, time.time() - start
+        return ok, None, time.time() - start
+
+    return await asyncio.gather(*(_run_one(page_dir, slug) for page_dir, slug, _ in targets))

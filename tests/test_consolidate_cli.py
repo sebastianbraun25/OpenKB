@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from click.testing import CliRunner
 
@@ -42,7 +42,9 @@ class TestConsolidateDryRun:
         _seed_page_with_notes(kb_dir)
         path = kb_dir / "wiki" / "concepts" / "approval-workflows.md"
         before = path.read_text(encoding="utf-8")
-        with patch("openkb.agent.consolidator.consolidate_page") as mock_consolidate:
+        with patch(
+            "openkb.agent.consolidator.consolidate_page", new_callable=AsyncMock
+        ) as mock_consolidate:
             result = _invoke(kb_dir, ["consolidate", "--all", "--dry-run"])
 
         assert result.exit_code == 0, result.output
@@ -53,7 +55,9 @@ class TestConsolidateDryRun:
 
     def test_min_notes_filters_dry_run_candidates(self, kb_dir):
         _seed_page_with_notes(kb_dir)
-        with patch("openkb.agent.consolidator.consolidate_page") as mock_consolidate:
+        with patch(
+            "openkb.agent.consolidator.consolidate_page", new_callable=AsyncMock
+        ) as mock_consolidate:
             result = _invoke(kb_dir, ["consolidate", "--all", "--min-notes", "5", "--dry-run"])
 
         assert result.exit_code == 0, result.output
@@ -64,7 +68,11 @@ class TestConsolidateDryRun:
 class TestConsolidateExecution:
     def test_single_page_by_name_dispatches_consolidate_page(self, kb_dir):
         _seed_page_with_notes(kb_dir)
-        with patch("openkb.agent.consolidator.consolidate_page", return_value=True) as mock_c:
+        with patch(
+            "openkb.agent.consolidator.consolidate_page",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_c:
             result = _invoke(kb_dir, ["consolidate", "approval-workflows"])
 
         assert result.exit_code == 0, result.output
@@ -78,7 +86,11 @@ class TestConsolidateExecution:
 
     def test_all_with_yes_skips_confirmation(self, kb_dir):
         _seed_page_with_notes(kb_dir)
-        with patch("openkb.agent.consolidator.consolidate_page", return_value=True) as mock_c:
+        with patch(
+            "openkb.agent.consolidator.consolidate_page",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_c:
             result = _invoke(kb_dir, ["consolidate", "--all", "--yes"])
 
         assert result.exit_code == 0, result.output
@@ -87,7 +99,11 @@ class TestConsolidateExecution:
 
     def test_skip_result_counts_as_skipped(self, kb_dir):
         _seed_page_with_notes(kb_dir)
-        with patch("openkb.agent.consolidator.consolidate_page", return_value=False):
+        with patch(
+            "openkb.agent.consolidator.consolidate_page",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
             result = _invoke(kb_dir, ["consolidate", "approval-workflows"])
 
         assert result.exit_code == 0, result.output
@@ -98,6 +114,7 @@ class TestConsolidateExecution:
         _seed_page_with_notes(kb_dir, slug="second-page")
         with patch(
             "openkb.agent.consolidator.consolidate_page",
+            new_callable=AsyncMock,
             side_effect=[ValueError("boom"), True],
         ):
             result = _invoke(kb_dir, ["consolidate", "--all", "--yes"])
