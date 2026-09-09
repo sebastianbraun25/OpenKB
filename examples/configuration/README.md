@@ -105,15 +105,16 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 #   - dataset
 #   - model
 
-# Optional: reject an entity whose LLM-returned type doesn't match
-# entity_types (above) instead of coercing it to "other". Off by default
-# (backward compatible); turn on for a narrow, domain-specific entity_types
-# list where an "other"-typed entity usually signals a bad/too-specific
-# candidate you'd rather drop than keep. Also enables a name-length gate:
-# a brand-new entity name longer than 3 words is dropped too (concepts
-# always enforce this cap; entities only opt in together with this flag).
+# Optional: strict mode for brand-new concept/entity `create` items. Off by
+# default (backward compatible). When true:
+#   - a brand-new concept or entity name longer than 3 words is dropped
+#     (a lightweight proxy for "too specific to be reusable knowledge").
+#   - an entity whose LLM-returned type doesn't match entity_types (above)
+#     is dropped instead of coerced to "other" (entities only, concepts
+#     have no type) — useful for a narrow, domain-specific entity_types
+#     list where an "other"-typed entity usually signals a bad candidate.
 # Drops are logged as warnings, never silent.
-# strict_entity_types: false
+# strict_item_mode: false
 
 # Optional: LLM / LiteLLM tuning. Keys are forwarded to LiteLLM; `timeout` and
 # `extra_headers` apply per request, the rest are set as litellm.<key>.
@@ -143,7 +144,7 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 | `insert_mode` | `normal` | How a partially-failed compile (some concept/entity couldn't be generated) is reported. `normal` logs a warning and still reports the file "added". `fail-fast` aborts on the first failure; `fail-at-end` attempts every planned concept/entity first (so every failure is logged in one pass). Both strict modes roll back the add and report it "failed" instead of "added". |
 | `parallel_tool_calls` | unset | Whether the LLM agents (query, chat, lint, skill) may call tools in parallel. Unset keeps OpenKB's per-agent defaults; `true`/`false` force allow/sequential for every agent; `null` omits the setting (provider default). **Amazon Bedrock needs `null`** (see below). |
 | `entity_types` | 7 defaults | Custom vocabulary for entity pages. `other` is always kept. |
-| `strict_entity_types` | `false` | When `true`, drops an entity whose type doesn't match `entity_types` instead of coercing it to `other`, and also drops a brand-new entity name longer than 3 words (concepts always enforce the name-length cap; entities only opt in together with this flag). Drops are logged as warnings, never silent. |
+| `strict_item_mode` | `false` | When `true`, drops a brand-new concept/entity name longer than 3 words, and drops an entity whose type doesn't match `entity_types` instead of coercing it to `other`. Drops are logged as warnings, never silent. |
 | `debug` | `false` | Enable per-file debug logging to `logs/<file>.log` (see below) without needing `-v` on every command. |
 | `litellm:` | – | A pass-through block for LiteLLM. See below. |
 
