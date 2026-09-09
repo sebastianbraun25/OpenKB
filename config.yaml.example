@@ -41,7 +41,10 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 # entity_types (above) instead of coercing it to "other". Off by default
 # (backward compatible); turn on for a narrow, domain-specific entity_types
 # list where an "other"-typed entity usually signals a bad/too-specific
-# candidate you'd rather drop than keep.
+# candidate you'd rather drop than keep. Also enables a name-length gate:
+# a brand-new entity name longer than 3 words is dropped too (concepts
+# always enforce this cap; entities only opt in together with this flag).
+# Drops are logged as warnings, never silent.
 # strict_entity_types: false
 
 # Optional: how concept/entity pages absorb new documents on `openkb add`.

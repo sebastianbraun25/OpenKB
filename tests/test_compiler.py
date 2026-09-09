@@ -228,7 +228,9 @@ class TestStrictEntityTypes:
 class TestMaxWordsFilter:
     """Hard cap on brand-new concept/entity names to 3 words (see
     compiler._count_words / issue #247) — a lightweight proxy for "too
-    specific to be reusable knowledge"."""
+    specific to be reusable knowledge". Concepts always enforce this cap;
+    entities only enforce it when strict=True (opt-in together with
+    strict_entity_types, see issue #247 follow-up)."""
 
     def test_count_words_splits_on_hyphen_underscore_and_space(self):
         assert _count_words("attention") == 1
@@ -250,18 +252,47 @@ class TestMaxWordsFilter:
         out = _filter_concept_items(items, "update")
         assert len(out) == 1
 
-    def test_entity_items_over_limit_are_dropped(self):
+    def test_entity_items_over_limit_are_dropped_when_strict(self):
         items = [
             {"name": "nvidia", "title": "NVIDIA", "type": "organization"},
             {"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas", "type": "person"},
         ]
-        out = _filter_entity_items(items, max_words=3)
+        out = _filter_entity_items(items, max_words=3, strict=True)
         assert [e["name"] for e in out] == ["nvidia"]
+
+    def test_entity_items_over_limit_kept_when_not_strict(self):
+        # The word-length gate is opt-in together with strict_entity_types
+        # (see issue #247 follow-up) — passing max_words alone must not drop
+        # anything unless strict=True is also set.
+        items = [
+            {"name": "nvidia", "title": "NVIDIA", "type": "organization"},
+            {"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas", "type": "person"},
+        ]
+        out = _filter_entity_items(items, max_words=3, strict=False)
+        assert [e["name"] for e in out] == ["nvidia", "andreas-mueller-alwart-ssmpa-2573"]
 
     def test_entity_items_without_max_words_are_unaffected(self):
         items = [{"name": "andreas-mueller-alwart-ssmpa-2573", "title": "Andreas", "type": "other"}]
         out = _filter_entity_items(items)
         assert len(out) == 1
+
+    def test_dropped_entity_items_are_logged_at_warning_not_silently(self, caplog):
+        # Drops must be visible without -v/--verbose (root logger defaults to
+        # WARNING, see cli.py) — logging them at INFO would be effectively
+        # silent for a normal `openkb add` run.
+        import logging
+
+        valid = frozenset({"person", "other"})
+        items = [
+            {"name": "andreas-mueller-alwart-ssmpa-2573", "title": "A", "type": "person"},
+            {"name": "x", "title": "X", "type": "organization"},
+        ]
+        with caplog.at_level(logging.WARNING, logger="openkb.agent.compiler"):
+            out = _filter_entity_items(items, valid, strict=True, max_words=3)
+        assert out == []
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("over 3 words" in m for m in messages)
+        assert any("type outside the configured" in m for m in messages)
 
 
 class TestParseEntitiesPlanStrictAndMaxWords:
@@ -302,6 +333,22 @@ class TestParseEntitiesPlanStrictAndMaxWords:
         out = _parse_entities_plan(parsed, valid, strict=True, max_words=3)
         assert len(out["update"]) == 1
         assert out["update"][0]["type"] == "other"  # coerced, not strict-dropped
+
+    def test_create_max_words_ignored_without_strict(self):
+        # The name-length gate is opt-in together with strict_entity_types —
+        # passing max_words without strict=True must not drop long names.
+        valid = frozenset({"person", "other"})
+        parsed = {
+            "entities": {
+                "create": [
+                    {"name": "andreas-mueller-alwart-ssmpa-2573", "title": "A", "type": "person"},
+                ],
+                "update": [],
+                "related": [],
+            }
+        }
+        out = _parse_entities_plan(parsed, valid, strict=False, max_words=3)
+        assert [e["name"] for e in out["create"]] == ["andreas-mueller-alwart-ssmpa-2573"]
 
 
 class TestDocTokenGuidance:
