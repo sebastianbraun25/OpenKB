@@ -1616,6 +1616,127 @@ class TestCompileShortDocFallbacks:
         index_text = (wiki / "index.md").read_text()
         assert "[[concepts/transformer]]" in index_text
 
+    @pytest.mark.asyncio
+    async def test_summary_rewrite_context_window_exceeded_retries_with_summary_only(
+        self, tmp_path
+    ):
+        """summary-rewrite's prompt carries doc_msg plus the whitelist of
+        every existing concept/entity page (known_targets_msg), which grows
+        with the KB (#226) just like the concepts-plan index — so it can
+        blow the context window on a document whose concepts-plan call (a
+        smaller prompt, no whitelist) still fit. Mirrors the concepts-plan
+        fix: retry once with doc_msg dropped before falling back to v1."""
+        wiki, source_path = self._setup_kb(tmp_path)
+        (wiki / "concepts" / "transformer.md").write_text(
+            "---\ndescription: Existing\n---\n\nExisting content.", encoding="utf-8"
+        )
+
+        v1_summary_content = "# Summary\n\nDiscusses transformers."
+        summary_response = json.dumps(
+            {"description": "A real summary", "content": v1_summary_content}
+        )
+        plan_response = json.dumps(
+            {
+                "create": [],
+                "update": [{"name": "transformer", "title": "Transformer"}],
+                "related": [],
+            }
+        )
+        concept_response = json.dumps({"description": "C", "content": "# T\n\nUpdated body."})
+        rewritten_summary = "# Summary\n\nRewritten: discusses [[concepts/transformer]]."
+        error = litellm.ContextWindowExceededError(
+            message="prompt is too long: 200400 tokens > 200000 maximum",
+            model="claude-sonnet-4-5",
+            llm_provider="anthropic",
+        )
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                return [_mock_response(summary_response)]
+            if idx == 1:
+                return [_mock_response(plan_response)]
+            if idx == 2:
+                raise error
+            return [_mock_response(rewritten_summary)]
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=side_effect)
+            mock_litellm.acompletion = AsyncMock(side_effect=_mock_acompletion([concept_response]))
+            await compile_short_doc("doc", source_path, tmp_path, "claude-sonnet-4-5")
+            # summary + concepts-plan + summary-rewrite (full doc, fails) +
+            # summary-rewrite retry (summary only, succeeds).
+            assert mock_litellm.completion.call_count == 4
+
+        # The retry attempt must not still include the full document message
+        # (_SUMMARY_USER's "Full text:" marker only ever appears in doc_msg).
+        retry_messages = mock_litellm.completion.call_args_list[3].kwargs["messages"]
+        retry_text = json.dumps(retry_messages)
+        assert "Full text:" not in retry_text
+
+        summary_path = wiki / "summaries" / "doc.md"
+        assert summary_path.exists()
+        text = summary_path.read_text()
+        assert "Rewritten" in text  # retried rewrite content used, not v1
+        assert "[[concepts/transformer]]" in text
+
+    @pytest.mark.asyncio
+    async def test_summary_rewrite_context_window_retry_also_fails_falls_back_to_v1(self, tmp_path):
+        """If the summary-only retry ALSO hits the context window (or any
+        other error), the existing v1 fallback still applies unchanged —
+        the real v1 summary (ghost-stripped) is written, never lost."""
+        wiki, source_path = self._setup_kb(tmp_path)
+        (wiki / "concepts" / "transformer.md").write_text(
+            "---\ndescription: Existing\n---\n\nExisting content.", encoding="utf-8"
+        )
+
+        v1_summary_content = (
+            "# Summary\n\nDiscusses [[concepts/transformer]] and [[concepts/ghost]]."
+        )
+        summary_response = json.dumps(
+            {"description": "A real summary", "content": v1_summary_content}
+        )
+        plan_response = json.dumps(
+            {
+                "create": [],
+                "update": [{"name": "transformer", "title": "Transformer"}],
+                "related": [],
+            }
+        )
+        concept_response = json.dumps({"description": "C", "content": "# T\n\nUpdated body."})
+        error = litellm.ContextWindowExceededError(
+            message="prompt is too long: 200400 tokens > 200000 maximum",
+            model="claude-sonnet-4-5",
+            llm_provider="anthropic",
+        )
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                return [_mock_response(summary_response)]
+            if idx == 1:
+                return [_mock_response(plan_response)]
+            raise error  # both the first rewrite attempt and its retry fail
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=side_effect)
+            mock_litellm.acompletion = AsyncMock(side_effect=_mock_acompletion([concept_response]))
+            # Must not raise out of compile_short_doc.
+            await compile_short_doc("doc", source_path, tmp_path, "claude-sonnet-4-5")
+            assert mock_litellm.completion.call_count == 4
+
+        summary_path = wiki / "summaries" / "doc.md"
+        assert summary_path.exists()
+        text = summary_path.read_text()
+        assert "Discusses" in text  # real v1 content kept, not lost
+        assert "[[concepts/transformer]]" in text  # valid link kept
+        assert "[[concepts/ghost]]" not in text  # ghost link stripped
+        assert "ghost" in text  # display text preserved
+
 
 class TestOversizedDocumentSkip:
     """A document whose content can't fit an LLM call is treated like an
