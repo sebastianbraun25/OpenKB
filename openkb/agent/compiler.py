@@ -1892,21 +1892,17 @@ async def _compile_concepts(
             )
         _write_summary(wiki_dir, doc_name, cleaned, description=doc_brief)
 
+    concepts_plan_user_msg = {
+        "role": "user",
+        "content": _CONCEPTS_PLAN_USER.format(
+            concept_briefs=concept_briefs,
+            entity_briefs=entity_briefs,
+        ).replace("__ENTITY_TYPES__", types_str),
+    }
     try:
         plan_raw = _llm_call(
             model,
-            [
-                system_msg,
-                doc_msg,
-                summary_msg,
-                {
-                    "role": "user",
-                    "content": _CONCEPTS_PLAN_USER.format(
-                        concept_briefs=concept_briefs,
-                        entity_briefs=entity_briefs,
-                    ).replace("__ENTITY_TYPES__", types_str),
-                },
-            ],
+            [system_msg, doc_msg, summary_msg, concepts_plan_user_msg],
             "concepts-plan",
             response_format=_JSON_RESPONSE_FORMAT,
             bundle=bundle,
@@ -1916,14 +1912,39 @@ async def _compile_concepts(
         # _read_concept_briefs/_read_entity_briefs) and is added on top of the
         # already-cached document — a doc that was fine for the summary call
         # can still blow the window here once the index gets large enough.
-        # The summary itself already exists (unlike the doc-too-large case
-        # above), so it's kept — same fallback as an unparseable/empty plan,
-        # just skipping concept/entity generation for this doc.
-        logger.warning("Skipping concept/entity extraction for %s: %s", doc_name, exc)
-        if rewrite_summary:
-            _write_v1_summary_stripped()
-        _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
-        return
+        # Retry once without the full document: the plan prompt already asks
+        # the model to work "based on the summary above" (see
+        # _CONCEPTS_PLAN_USER), so dropping doc_msg usually shrinks the
+        # prompt back under the window without losing the plan's intent.
+        logger.warning(
+            "concepts plan exceeded context window for %s: %s; retrying with summary as source",
+            doc_name,
+            exc,
+        )
+        sys.stdout.write(
+            f"    [WARN] concepts plan exceeded context window for {doc_name} — "
+            "retrying with the summary as source instead of the full document.\n"
+        )
+        sys.stdout.flush()
+        try:
+            plan_raw = _llm_call(
+                model,
+                [system_msg, summary_msg, concepts_plan_user_msg],
+                "concepts-plan",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+        except _NON_RETRYABLE_LLM_ERRORS as retry_exc:
+            # Still too large even with just the summary (e.g. the existing
+            # concept/entity index alone is huge) — the summary itself
+            # already exists (unlike the doc-too-large case above), so it's
+            # kept — same fallback as an unparseable/empty plan, just
+            # skipping concept/entity generation for this doc.
+            logger.warning("Skipping concept/entity extraction for %s: %s", doc_name, retry_exc)
+            if rewrite_summary:
+                _write_v1_summary_stripped()
+            _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
+            return
 
     try:
         parsed = _parse_json(plan_raw)
