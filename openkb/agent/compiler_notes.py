@@ -34,6 +34,7 @@ _CONCEPT_NOTE_CREATE_USER = """\
 This is a NEW concept page: {title}
 
 This concept was just identified in document "{doc_name}" (summarized above).
+{extra_context}
 
 Return a JSON object with two keys:
 - "description": A single sentence (under 100 chars) defining this concept
@@ -62,6 +63,7 @@ _ENTITY_NOTE_CREATE_USER = """\
 This is a NEW entity page: {title} (type: {type})
 
 This entity was just identified in document "{doc_name}" (summarized above).
+{extra_context}
 
 Return a JSON object with two keys:
 - "description": A single sentence (under 100 chars) identifying this entity

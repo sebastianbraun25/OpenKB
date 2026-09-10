@@ -1403,7 +1403,9 @@ def _stream_then_raise(chunks: list[object], error: Exception):
     raise error
 
 
-def _seed_pending(kb_dir, kind: str, slug: str, title: str, n: int = 2, type_: str | None = None):
+def _seed_pending(
+    kb_dir, kind: str, slug: str, description: str, n: int = 2, type_: str | None = None
+):
     """Pre-seed the pending-topics buffer (see openkb.pending / issue #247) so
     the NEXT mention of ``slug`` promotes it to a real page instead of just
     buffering another note — lets create-path tests written before the
@@ -1414,7 +1416,23 @@ def _seed_pending(kb_dir, kind: str, slug: str, title: str, n: int = 2, type_: s
         store.add_note(
             kind,
             slug,
-            title,
+            description,
+            f"prior-doc-{i}",
+            f"summaries/prior-doc-{i}.md",
+            f"prior note {i}",
+            type_=type_,
+        )
+    """Pre-seed the pending-topics buffer (see openkb.pending / issue #247) so
+    the NEXT mention of ``slug`` promotes it to a real page instead of just
+    buffering another note — lets create-path tests written before the
+    pending buffer keep asserting an immediate page write.
+    """
+    store = PendingTopicsStore(kb_dir / ".openkb" / "pending_topics.json")
+    for i in range(n):
+        store.add_note(
+            kind,
+            slug,
+            description,
             f"prior-doc-{i}",
             f"summaries/prior-doc-{i}.md",
             f"prior note {i}",

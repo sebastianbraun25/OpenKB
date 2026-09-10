@@ -58,7 +58,7 @@ class PendingTopicsStore:
         self,
         kind: str,
         slug: str,
-        title: str,
+        description: str,
         doc_name: str,
         source_file: str,
         note: str,
@@ -66,11 +66,17 @@ class PendingTopicsStore:
     ) -> int:
         """Append a note for ``slug``, creating the entry if it's missing.
 
+        ``description`` is the LLM-generated one-sentence brief for this note
+        (same value a real page's frontmatter ``description`` would get) —
+        always overwritten with the latest call's value, not accumulated as a
+        list, so it reflects the most recent summary of the topic across all
+        buffered notes so far.
+
         Returns the new total note count (callers promote once this reaches
         ``MAX_NOTES_BEFORE_PROMOTION + 1``, i.e. the 3rd note).
         """
-        entry = self._data[kind].setdefault(slug, {"title": title, "notes": []})
-        entry["title"] = title
+        entry = self._data[kind].setdefault(slug, {"description": description, "notes": []})
+        entry["description"] = description
         if type_ is not None:
             entry["type"] = type_
         entry["notes"].append(
@@ -91,7 +97,7 @@ class PendingTopicsStore:
             self._persist()
 
     def brief_lines(self, kind: str) -> list[str]:
-        """Return ``- {slug} (pending, {n}/{total} mentions) — {last note}`` lines.
+        """Return ``- {slug} (pending, {n}/{total} mentions) — {description}`` lines.
 
         Extends the plan call's existing-page briefs so the LLM treats
         pending topics like quasi-existing pages for dedup ("prefer update"/
@@ -99,13 +105,20 @@ class PendingTopicsStore:
         must NEVER be added to the wikilink whitelist (no real page exists
         yet) — enforcing that is the caller's responsibility, not this
         method's.
+
+        ``entry["description"]`` is read directly (no fallback): every entry
+        is guaranteed to have one, either from ``add_note`` or from the
+        one-time migration of legacy entries that predate this field (see
+        issue #247 follow-up) — a missing field is a genuine data bug, so it
+        raises a plain ``KeyError`` rather than degrading silently.
         """
         total = MAX_NOTES_BEFORE_PROMOTION + 1
         lines: list[str] = []
         for slug, entry in self._data[kind].items():
             notes = entry.get("notes", [])
-            last = notes[-1]["note"] if notes else ""
-            lines.append(f"- {slug} (pending, {len(notes)}/{total} mentions) — {last}")
+            lines.append(
+                f"- {slug} (pending, {len(notes)}/{total} mentions) — {entry['description']}"
+            )
         return lines
 
     def _persist(self) -> None:
