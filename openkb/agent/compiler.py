@@ -3119,21 +3119,48 @@ async def _compile_concepts(
     # the full whitelist, so the summary is always written and never wiped.
     if rewrite_summary:
         candidate: str | None = None
+        summary_rewrite_user_msg = {"role": "user", "content": _SUMMARY_REWRITE_USER}
         try:
             # No max_tokens cap — matches the v1 summary call. The rewrite
             # prompt asks the model to keep length within ±20% of the v1.
-            rewrite_raw = _llm_call(
-                model,
-                [
-                    system_msg,
-                    doc_msg,  # cached (BP1)
-                    summary_msg,  # cached (BP2) — contains the v1 summary text
-                    known_targets_msg,  # cached (BP3) — whitelist
-                    {"role": "user", "content": _SUMMARY_REWRITE_USER},
-                ],
-                "summary-rewrite",
-                bundle=bundle,
-            )
+            try:
+                rewrite_raw = _llm_call(
+                    model,
+                    [
+                        system_msg,
+                        doc_msg,  # cached (BP1)
+                        summary_msg,  # cached (BP2) — contains the v1 summary text
+                        known_targets_msg,  # cached (BP3) — whitelist
+                        summary_rewrite_user_msg,
+                    ],
+                    "summary-rewrite",
+                    bundle=bundle,
+                )
+            except _NON_RETRYABLE_LLM_ERRORS as exc:
+                # known_targets_msg grows with the KB just like the
+                # concepts-plan index (#226) — a doc whose earlier calls fit
+                # can still blow the window here once the whitelist gets
+                # large enough. Retry once without the full document: the
+                # rewrite prompt only asks the model to reconcile the
+                # already-generated summary (summary_msg) against the
+                # whitelist, not the original document.
+                logger.warning(
+                    "summary-rewrite exceeded context window for %s: %s; "
+                    "retrying with summary as source",
+                    doc_name,
+                    exc,
+                )
+                sys.stdout.write(
+                    f"    [WARN] summary-rewrite exceeded context window for {doc_name} — "
+                    "retrying with the summary as source instead of the full document.\n"
+                )
+                sys.stdout.flush()
+                rewrite_raw = _llm_call(
+                    model,
+                    [system_msg, summary_msg, known_targets_msg, summary_rewrite_user_msg],
+                    "summary-rewrite",
+                    bundle=bundle,
+                )
             candidate = rewrite_raw.strip()
             # Strip frontmatter if the model added one anyway.
             cand_parts = frontmatter.split(candidate)
