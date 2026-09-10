@@ -1846,9 +1846,11 @@ class TestCompileShortDocFallbacks:
         """The summary call already succeeded with real content by the time
         concepts-plan runs (unlike TestOversizedDocumentSkip, where the doc
         itself is too large) — this must NOT be replaced with a generic
-        "too large" stub. Same fallback as an unparseable/empty plan: keep
-        the real v1 summary (ghost-stripped), index it, skip concept/entity
-        generation for this doc."""
+        "too large" stub. The concepts-plan call is retried once with the
+        summary as source (doc_msg dropped) before giving up; if that retry
+        ALSO hits the context window, same fallback as an unparseable/empty
+        plan: keep the real v1 summary (ghost-stripped), index it, skip
+        concept/entity generation for this doc."""
         wiki, source_path = self._setup_kb(tmp_path)
 
         v1_summary_content = "# Summary\n\nDiscusses [[concepts/nonexistent]] here."
@@ -1873,8 +1875,15 @@ class TestCompileShortDocFallbacks:
             mock_litellm.completion = MagicMock(side_effect=side_effect)
             # Must not raise out of compile_short_doc.
             await compile_short_doc("doc", source_path, tmp_path, "claude-sonnet-4-5")
-            # summary + concepts-plan, no wasted retries on the doomed request.
-            assert mock_litellm.completion.call_count == 2
+            # summary + concepts-plan (full doc) + concepts-plan retry (summary
+            # only) — both plan attempts are doomed here, no further retries.
+            assert mock_litellm.completion.call_count == 3
+
+        # The retry attempt must not still include the full document message
+        # (_SUMMARY_USER's "Full text:" marker only ever appears in doc_msg).
+        retry_messages = mock_litellm.completion.call_args_list[2].kwargs["messages"]
+        retry_text = json.dumps(retry_messages)
+        assert "Full text:" not in retry_text
 
         summary_path = wiki / "summaries" / "doc.md"
         assert summary_path.exists()
@@ -1887,6 +1896,69 @@ class TestCompileShortDocFallbacks:
         index_text = (wiki / "index.md").read_text()
         assert "[[summaries/doc]]" in index_text
         assert not list((wiki / "concepts").glob("*.md"))
+
+    @pytest.mark.asyncio
+    async def test_concepts_plan_context_window_retry_succeeds_with_summary_only(self, tmp_path):
+        """When the retry (summary-only) succeeds, the plan is processed
+        normally — concepts are generated from the summary-derived plan
+        instead of the doc being treated as incomplete. Uses an "update" plan
+        item against a pre-existing concept page (rather than "create") so
+        this test's mock shape stays independent of any create-time gating
+        (e.g. a pending-topics buffer) a given branch may layer on top."""
+        wiki, source_path = self._setup_kb(tmp_path)
+        (wiki / "concepts" / "transformer.md").write_text(
+            "---\ndescription: Existing\n---\n\nExisting content.", encoding="utf-8"
+        )
+
+        v1_summary_content = "# Summary\n\nDiscusses transformers."
+        summary_response = json.dumps(
+            {"description": "A real summary", "content": v1_summary_content}
+        )
+        error = litellm.ContextWindowExceededError(
+            message="prompt is too long: 220670 tokens > 200000 maximum",
+            model="claude-sonnet-4-5",
+            llm_provider="anthropic",
+        )
+        plan_response = json.dumps(
+            {
+                "create": [],
+                "update": [{"name": "transformer", "title": "Transformer"}],
+                "related": [],
+            }
+        )
+        concept_response = json.dumps({"description": "C", "content": "# T\n\nUpdated body."})
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                return [_mock_response(summary_response)]
+            if idx == 1:
+                raise error
+            return [_mock_response(plan_response)]
+
+        with (
+            patch("openkb.agent.compiler.litellm") as mock_litellm,
+        ):
+            mock_litellm.completion = MagicMock(side_effect=side_effect)
+            mock_litellm.acompletion = AsyncMock(side_effect=_mock_acompletion([concept_response]))
+            await compile_short_doc("doc", source_path, tmp_path, "claude-sonnet-4-5")
+            # summary + concepts-plan (full doc, fails) + concepts-plan retry
+            # (summary only, succeeds) + summary-rewrite (rewrite_summary=True).
+            assert mock_litellm.completion.call_count == 4
+
+        # The successful retry's messages must not include the full document
+        # message (_SUMMARY_USER's "Full text:" marker only ever appears in doc_msg).
+        retry_messages = mock_litellm.completion.call_args_list[2].kwargs["messages"]
+        retry_text = json.dumps(retry_messages)
+        assert "Full text:" not in retry_text
+
+        concept_path = wiki / "concepts" / "transformer.md"
+        assert concept_path.exists()
+
+        index_text = (wiki / "index.md").read_text()
+        assert "[[concepts/transformer]]" in index_text
 
 
 class TestOversizedDocumentSkip:
