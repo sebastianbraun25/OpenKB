@@ -1345,7 +1345,9 @@ def _mock_acompletion(responses: list[str]):
     return side_effect
 
 
-def _seed_pending(kb_dir, kind: str, slug: str, title: str, n: int = 2, type_: str | None = None):
+def _seed_pending(
+    kb_dir, kind: str, slug: str, description: str, n: int = 2, type_: str | None = None
+):
     """Pre-seed the pending-topics buffer (see openkb.pending / issue #247) so
     the NEXT mention of ``slug`` promotes it to a real page instead of just
     buffering another note — lets create-path tests written before the
@@ -1356,7 +1358,7 @@ def _seed_pending(kb_dir, kind: str, slug: str, title: str, n: int = 2, type_: s
         store.add_note(
             kind,
             slug,
-            title,
+            description,
             f"prior-doc-{i}",
             f"summaries/prior-doc-{i}.md",
             f"prior note {i}",

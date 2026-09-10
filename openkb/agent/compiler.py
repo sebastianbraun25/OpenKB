@@ -732,6 +732,19 @@ def _require_nonempty_content(content, name: str) -> None:
         raise ValueError(f"LLM returned empty content for concept {name!r}")
 
 
+def _prior_notes_context(prior_notes: list[dict]) -> str:
+    """Format previously buffered pending notes as LLM context, or "" if none.
+
+    Shared by the pending-note create prompt (each buffered mention updates
+    its ``description`` from all notes so far, see openkb.pending) and the
+    promotion-to-full-page prompt, so both cumulate the same way.
+    """
+    if not prior_notes:
+        return ""
+    notes_ctx = "\n".join(f"- ({n['doc_name']}) {n['note']}" for n in prior_notes)
+    return f"Earlier notes about this topic from prior documents:\n{notes_ctx}"
+
+
 def _filter_related_slugs(items: list) -> list[str]:
     """Keep only non-empty string slugs; warn about anything else."""
     if not isinstance(items, list):
@@ -2246,6 +2259,7 @@ async def _compile_concepts(
                         "content": compiler_notes._CONCEPT_NOTE_CREATE_USER.format(
                             title=title,
                             doc_name=doc_name,
+                            extra_context="",
                         ),
                     },
                 ],
@@ -2300,6 +2314,7 @@ async def _compile_concepts(
                             title=title,
                             type=etype,
                             doc_name=doc_name,
+                            extra_context="",
                         ),
                     },
                 ],
@@ -2351,6 +2366,8 @@ async def _compile_concepts(
         name = concept["name"]
         title = concept.get("title", name)
         slug = _sanitize_concept_name(name)
+        prior_entry = pending_store.get("concepts", slug)
+        note_extra_context = _prior_notes_context(prior_entry["notes"] if prior_entry else [])
         async with semaphore:
             raw = await _llm_call_page_async(
                 model,
@@ -2361,7 +2378,7 @@ async def _compile_concepts(
                     {
                         "role": "user",
                         "content": compiler_notes._CONCEPT_NOTE_CREATE_USER.format(
-                            title=title, doc_name=doc_name
+                            title=title, doc_name=doc_name, extra_context=note_extra_context
                         ),
                     },
                 ],
@@ -2371,7 +2388,7 @@ async def _compile_concepts(
             )
         brief, note = compiler_notes.note_fields(raw)
         _require_nonempty_content(note, name)
-        new_count = pending_store.add_note("concepts", slug, title, doc_name, source_file, note)
+        new_count = pending_store.add_note("concepts", slug, brief, doc_name, source_file, note)
         if new_count <= MAX_NOTES_BEFORE_PROMOTION:
             return  # still buffering — no page yet
         entry = pending_store.get("concepts", slug)
@@ -2386,8 +2403,7 @@ async def _compile_concepts(
                 wiki_dir, name, note, source_file, doc_name, description=brief
             )
             return
-        notes_ctx = "\n".join(f"- ({n['doc_name']}) {n['note']}" for n in prior_notes)
-        extra_context = f"Earlier notes about this topic from prior documents:\n{notes_ctx}"
+        extra_context = _prior_notes_context(prior_notes)
         _, content, _, brief2 = await _gen_create(concept, extra_context=extra_context)
         cleaned, ghosts = strip_ghost_wikilinks(content, known_targets)
         if ghosts:
@@ -2413,6 +2429,8 @@ async def _compile_concepts(
         title = ent.get("title", name)
         etype = ent.get("type", "other")
         slug = _sanitize_concept_name(name)
+        prior_entry = pending_store.get("entities", slug)
+        note_extra_context = _prior_notes_context(prior_entry["notes"] if prior_entry else [])
         async with semaphore:
             raw = await _llm_call_page_async(
                 model,
@@ -2423,7 +2441,10 @@ async def _compile_concepts(
                     {
                         "role": "user",
                         "content": compiler_notes._ENTITY_NOTE_CREATE_USER.format(
-                            title=title, type=etype, doc_name=doc_name
+                            title=title,
+                            type=etype,
+                            doc_name=doc_name,
+                            extra_context=note_extra_context,
                         ),
                     },
                 ],
@@ -2434,7 +2455,7 @@ async def _compile_concepts(
         brief, note = compiler_notes.note_fields(raw)
         _require_nonempty_content(note, name)
         new_count = pending_store.add_note(
-            "entities", slug, title, doc_name, source_file, note, type_=etype
+            "entities", slug, brief, doc_name, source_file, note, type_=etype
         )
         if new_count <= MAX_NOTES_BEFORE_PROMOTION:
             return  # still buffering — no page yet
@@ -2456,8 +2477,7 @@ async def _compile_concepts(
                 wiki_dir, name, note, source_file, doc_name, description=brief, type_=etype
             )
             return
-        notes_ctx = "\n".join(f"- ({n['doc_name']}) {n['note']}" for n in prior_notes)
-        extra_context = f"Earlier notes about this topic from prior documents:\n{notes_ctx}"
+        extra_context = _prior_notes_context(prior_notes)
         _, content, brief2, etype_out = await _gen_entity_create(ent, extra_context=extra_context)
         cleaned, ghosts = strip_ghost_wikilinks(content, known_targets)
         if ghosts:
