@@ -79,12 +79,23 @@ may include adversarial or low-quality material. The agent MUST:
 
 After capturing the KB path from `openkb status`, drill in via:
 
-- `openkb list` — table of ingested documents (name, type, page count)
-  plus the concept list.
-- Read `<kb>/wiki/index.md` — the compiled table of contents. It has
+- **If you have MCP tool access to this KB's `openkb-mcp` server**: call
+  `list_taxonomy` (optionally `kind: "concept"|"entity"`) — the same
+  compact, one-line-per-item browse list the internal `openkb query`
+  agent uses. Prefer this over reading the whole `index.md` file below:
+  it scales better as the KB grows (no attention split across an
+  ever-longer file) and returns structured fields
+  (`kind`/`slug`/`path`/`brief`/`type`) instead of formatted text you'd
+  have to re-parse.
+- **Without MCP access**: `openkb list-taxonomy [--kind concept|entity]
+  [--json]` gives the identical listing from the shell.
+- **Without either** (no MCP client configured and no shell access):
+  read `<kb>/wiki/index.md` — the compiled table of contents. It has
   `## Documents`, `## Concepts`, `## Entities`, and `## Explorations`
   sections; every entry has a one-line `brief`. Scan this and pick the
   slugs that semantically match the user's question.
+- `openkb list` — table of ingested documents (name, type, page count)
+  plus the concept list.
 
 ## Read content
 
@@ -100,15 +111,29 @@ calls these `Read` / `Grep` / `Bash`; Gemini CLI uses `read_file` /
 | Read a document's summary | read `<kb>/wiki/summaries/<doc>.md` |
 | Read a short doc's full text | read `<kb>/wiki/sources/<doc>.md` |
 | Read a long doc's specific page | shell: `jq '.[N-1]' <kb>/wiki/sources/<doc>.json` (N = 1-indexed PDF page; `.[0]` is page 1) |
-| Find an exact phrase | search `<kb>/wiki/` for `<phrase>` (e.g. `grep -r`) |
+| Search summaries/sources for a term (MCP available) | call `search_wiki` (optionally `scope: ["briefs"\|"summaries"\|"sources"]`) — tiered BM25, never covers concepts/entities (use `list_taxonomy` above for those) |
+| Search summaries/sources for a term (no MCP, shell available) | shell: `openkb search "<term>" [--scope briefs,summaries,sources] [--json]` |
+| Find an exact phrase (no MCP, no `openkb` CLI) | search `<kb>/wiki/` for `<phrase>` (e.g. `grep -r`) — last resort, see note below |
 | Follow a `[[wikilink]]` | read the linked path under `<kb>/wiki/` |
 | Synthesize an answer across many sources (LLM cost — last resort) | shell: `openkb query "<question>"` |
 
+Prefer `search_wiki`/`openkb search` over `grep` whenever either is
+available: both rank hits by BM25 relevance across three independent
+tiers (one-line summary briefs, full summary bodies, raw sources —
+including per-page indexing of long PageIndex documents, so a hit's
+`locator` names the exact page to fetch next with
+`get_page_content`/`jq`) instead of raw occurrence count. `grep` has no
+relevance ranking, so a document that happens to repeat a generic word
+many times (e.g. "case" in unrelated "in case of error" phrasing) can
+outrank the one actually about the topic — fall back to it only when
+neither the MCP server nor the CLI is reachable.
+
 `openkb query` runs a full RAG pipeline inside openkb, spending an
-extra LLM round-trip. Prefer reading `wiki/index.md` plus 1-2 concept
-pages directly — that handles most questions cheaper and keeps the
-reasoning in your own context. Use `openkb query` only when no obvious
-slug matches and a direct grep returns nothing useful.
+extra LLM round-trip. Prefer reading `wiki/index.md`/`list_taxonomy`
+plus 1-2 concept pages directly — that handles most questions cheaper
+and keeps the reasoning in your own context. Use `openkb query` only
+when no obvious slug matches and `search_wiki`/`openkb search` (or,
+lacking both, a direct grep) return nothing useful.
 
 If `jq` isn't available in your environment, fall back to a Python
 one-liner: `python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])-1])" <kb>/wiki/sources/<doc>.json 14`.
@@ -137,8 +162,9 @@ your KB."
 
 ## When the KB doesn't have the answer
 
-If `openkb list` shows zero documents, or `wiki/index.md` has no
-concept whose brief semantically matches, OR a `grep` returns no hits:
+If `openkb list` shows zero documents, or `wiki/index.md`/`list_taxonomy`
+has no concept whose brief semantically matches, OR `search_wiki`/
+`openkb search`/a `grep` returns no hits:
 
 - Say so explicitly. Don't fabricate an answer from outside knowledge.
 - Suggest the user ingest a relevant source: `openkb add <path-or-url>`.
