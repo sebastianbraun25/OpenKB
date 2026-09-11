@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from openkb.agent.tools import (
+    TaxonomyItem,
     artifact_event_from_write,
+    get_taxonomy_item,
     get_wiki_page_content,
+    list_taxonomy_items,
     list_wiki_files,
     parse_pages,
     read_wiki_file,
     read_wiki_image,
+    search_wiki,
     write_wiki_file,
 )
 
@@ -320,3 +324,156 @@ def test_artifact_event_none_for_non_output_zone():
 
 def test_artifact_event_none_for_bad_json():
     assert artifact_event_from_write("write_file", "not json", "Written: output/x.html") is None
+
+
+# ---------------------------------------------------------------------------
+# search_wiki
+# ---------------------------------------------------------------------------
+
+
+class TestSearchWiki:
+    def test_finds_matching_page(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "cnn.md").write_text(
+            "# Convolutional Neural Networks\n\nDropout regularization prevents overfitting."
+        )
+
+        result = search_wiki("dropout regularization", wiki_root)
+
+        assert "[[concepts/cnn]]" in result
+        assert "Convolutional Neural Networks" in result
+
+    def test_no_matches_returns_message(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "cnn.md").write_text("# CNN\n\nSomething else entirely.")
+
+        result = search_wiki("nonexistent_keyword_xyz", wiki_root)
+
+        assert result == "No matching pages found."
+
+    def test_respects_top_k(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "entities").mkdir()
+        for i in range(5):
+            (tmp_path / "entities" / f"e{i}.md").write_text(f"# Entity {i}\n\nkeyword {i}.")
+
+        result = search_wiki("keyword", wiki_root, top_k=2)
+
+        assert result.count("[[entities/") == 2
+
+
+# ---------------------------------------------------------------------------
+# list_taxonomy_items / get_taxonomy_item
+# ---------------------------------------------------------------------------
+
+
+class TestListTaxonomyItems:
+    def test_lists_concepts_and_entities_by_default(self, tmp_path):
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "attention.md").write_text(
+            '---\ndescription: "How attention works"\n---\n\n# Attention\n\nBody.'
+        )
+        (tmp_path / "entities").mkdir()
+        (tmp_path / "entities" / "acme.md").write_text(
+            '---\ntype: organization\ndescription: "A company"\n---\n\n# Acme\n\nBody.'
+        )
+
+        items = list_taxonomy_items(str(tmp_path))
+
+        assert len(items) == 2
+        by_slug = {i.slug: i for i in items}
+        assert by_slug["attention"].kind == "concept"
+        assert by_slug["attention"].brief == "How attention works"
+        assert by_slug["attention"].type is None
+        assert by_slug["acme"].kind == "entity"
+        assert by_slug["acme"].type == "organization"
+        assert by_slug["acme"].brief == "A company"
+
+    def test_kind_filter_restricts_to_one_directory(self, tmp_path):
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "c.md").write_text("# C\n\nBody.")
+        (tmp_path / "entities").mkdir()
+        (tmp_path / "entities" / "e.md").write_text("# E\n\nBody.")
+
+        items = list_taxonomy_items(str(tmp_path), kind="concept")
+
+        assert len(items) == 1
+        assert items[0].kind == "concept"
+
+    def test_legacy_brief_key_resolves(self, tmp_path):
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "c.md").write_text('---\nbrief: "legacy brief"\n---\n\n# C\n\nX.')
+
+        items = list_taxonomy_items(str(tmp_path))
+
+        assert items[0].brief == "legacy brief"
+
+    def test_missing_directories_return_empty_list(self, tmp_path):
+        assert list_taxonomy_items(str(tmp_path)) == []
+
+    def test_no_frontmatter_yields_empty_brief(self, tmp_path):
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "c.md").write_text("# C\n\nNo frontmatter here.")
+
+        items = list_taxonomy_items(str(tmp_path))
+
+        assert items[0].brief == ""
+
+    def test_invalid_kind_raises_value_error(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="Unknown kind"):
+            list_taxonomy_items(str(tmp_path), kind="document")
+
+    def test_items_are_taxonomy_item_instances(self, tmp_path):
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "c.md").write_text("# C\n\nBody.")
+
+        items = list_taxonomy_items(str(tmp_path))
+
+        assert isinstance(items[0], TaxonomyItem)
+
+
+class TestGetTaxonomyItem:
+    def test_reads_concept_page(self, tmp_path):
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "attention.md").write_text("# Attention\n\nFull content here.")
+
+        result = get_taxonomy_item("attention", str(tmp_path))
+
+        assert "Full content here." in result
+
+    def test_kind_disambiguates_same_slug(self, tmp_path):
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "acme.md").write_text("# Acme concept")
+        (tmp_path / "entities").mkdir()
+        (tmp_path / "entities" / "acme.md").write_text("# Acme entity")
+
+        assert "concept" in get_taxonomy_item("acme", str(tmp_path), kind="concept")
+        assert "entity" in get_taxonomy_item("acme", str(tmp_path), kind="entity")
+
+    def test_without_kind_checks_concepts_before_entities(self, tmp_path):
+        (tmp_path / "entities").mkdir()
+        (tmp_path / "entities" / "acme.md").write_text("# Acme entity only")
+
+        result = get_taxonomy_item("acme", str(tmp_path))
+
+        assert "Acme entity only" in result
+
+    def test_not_found_returns_message(self, tmp_path):
+        result = get_taxonomy_item("nonexistent", str(tmp_path))
+
+        assert result == "Taxonomy item not found: nonexistent"
+
+    def test_invalid_kind_raises_value_error(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="Unknown kind"):
+            get_taxonomy_item("slug", str(tmp_path), kind="document")
+
+    def test_path_traversal_is_rejected(self, tmp_path):
+        result = get_taxonomy_item("../../etc/passwd", str(tmp_path))
+
+        assert result == "Taxonomy item not found: ../../etc/passwd"
