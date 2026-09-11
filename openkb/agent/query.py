@@ -15,6 +15,9 @@ from openkb.agent.tools import (
     write_kb_file,
 )
 from openkb.agent.tools import (
+    list_taxonomy as list_taxonomy_impl,
+)
+from openkb.agent.tools import (
     search_wiki as search_wiki_impl,
 )
 from openkb.config import LlmCredentialBundle, resolve_model_settings
@@ -28,31 +31,40 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
 {schema_md}
 
 ## Search strategy
-1. Read index.md to see all documents and concepts with brief summaries.
-   Each document is marked (short) or (pageindex) to indicate its type.
+1. Read index.md to see all documents with brief summaries. Each document is
+   marked (short) or (pageindex) to indicate its type.
 2. Read relevant summary pages (summaries/) for document overviews.
    Summaries may omit details — if you need more, follow the summary's
-   `full_text` frontmatter field to the source (see step 4).
-3. Read concept pages (concepts/) for cross-document synthesis.
-4. For "who/what is X" questions about a specific named person, organization,
-   place, or product, read the matching page in entities/ first.
-5. If index.md's one-line summaries don't surface a specific detail you
-   need (a niche term, an exact figure, a buried fact), use
-   search_wiki(query) — a keyword-level full-text search over
-   concepts/entities/summaries. This is a hybrid fallback: use it in
-   addition to, not instead of, index.md navigation.
-6. When you need detailed source document content, each summary page has a
+   `full_text` frontmatter field to the source (see step 5).
+3. For concepts (cross-document synthesis) and entities ("who/what is X"
+   questions about a specific named person, organization, place, or
+   product), call list_taxonomy first — it's a compact, one-line-per-item
+   browse list, not a keyword search. Pick the slug(s) that match the
+   question's meaning by their brief, then read_file the matching
+   concepts/<slug>.md or entities/<slug>.md.
+4. If index.md's one-line summaries and list_taxonomy don't surface a
+   specific detail you need (a niche term, an exact figure, an
+   author/creation-date only present in a raw source), use
+   search_wiki(query, scope) — a tiered, keyword-level full-text search
+   over summaries/sources only (concepts/entities are step 3's job, never
+   search_wiki's). This is a hybrid fallback: use it in addition to, not
+   instead of, index.md/list_taxonomy navigation. Narrow scope to
+   ["sources"] when you specifically need a source-only detail (an exact
+   field name, an author, a date) that a generated summary would likely
+   omit; leave scope unset to search all tiers.
+5. When you need detailed source document content, each summary page has a
    `full_text` frontmatter field with the path to the original document content:
    - Short documents (doc_type: short): read_file with that path.
    - PageIndex documents (doc_type: pageindex): use get_page_content(doc_name, pages)
      with tight page ranges. The summary shows document tree structure with page
-     ranges to help you target. Never fetch the whole document.
-7. Source content may reference images. Short-doc .md pages link them
+     ranges to help you target. Never fetch the whole document. A search_wiki
+     hit with a "page" locator names the exact page to fetch.
+6. Source content may reference images. Short-doc .md pages link them
    note-relative (e.g. ![image](images/doc/file.png), resolved from
    wiki/sources/); long-doc JSON page metadata lists them wiki-root-relative
    (e.g. sources/images/doc/file.png). Pass either form as seen to the
    get_image tool — it accepts both.
-8. Synthesize a clear, concise, well-cited answer grounded in wiki content.
+7. Synthesize a clear, concise, well-cited answer grounded in wiki content.
 
 Answer based only on wiki content. Be concise.
 Before each tool call, output one short sentence explaining the reason.
@@ -92,17 +104,35 @@ def build_query_agent(
         return get_wiki_page_content(doc_name, pages, wiki_root)
 
     @function_tool
-    def search_wiki(query: str) -> str:
-        """Full-text (BM25) keyword search over concepts/entities/summaries.
+    def list_taxonomy(kind: str | None = None) -> str:
+        """List persisted concept/entity pages with one-line briefs (semantic browsing).
 
-        Hybrid fallback for when index.md's one-line summaries don't surface
-        a specific buried detail (a niche term, an exact figure, a fact).
-        Use in addition to, not instead of, index.md navigation.
+        Call this first for concept/entity questions and pick a slug by
+        meaning — this is a browse list, not a keyword search. Follow up
+        with read_file on the matching concepts/<slug>.md or
+        entities/<slug>.md to get the full page.
+
+        Args:
+            kind: "concept" or "entity" to restrict the list; omit for both.
+        """
+        return list_taxonomy_impl(wiki_root, kind=kind)
+
+    @function_tool
+    def search_wiki(query: str, scope: list[str] | None = None) -> str:
+        """Tiered full-text (BM25) keyword search over summaries/sources.
+
+        Hybrid fallback for when index.md's one-line summaries and
+        list_taxonomy don't surface a specific buried detail (a niche term,
+        an exact figure, a fact only present in a raw source). Never
+        searches concepts/entities — use list_taxonomy for those. Use in
+        addition to, not instead of, index.md/list_taxonomy navigation.
 
         Args:
             query: Free-text search query (keywords or a natural-language question).
+            scope: Restrict to a subset of "briefs", "summaries", "sources";
+                omit to search all three tiers.
         """
-        return search_wiki_impl(query, wiki_root)
+        return search_wiki_impl(query, wiki_root, scope=scope)
 
     @function_tool
     def get_image(image_path: str) -> ToolOutputImage | ToolOutputText:
@@ -138,7 +168,7 @@ def build_query_agent(
     return Agent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, search_wiki, get_image],
+        tools=[read_file, get_page_content, list_taxonomy, search_wiki, get_image],
         model=f"litellm/{model}",
         model_settings=ModelSettings(**model_settings),
     )
