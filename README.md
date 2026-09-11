@@ -345,7 +345,17 @@ The skill is read-only. It won't run `openkb add`, `remove`, or `lint --fix` wit
 
 ### Using with an MCP client
 
-For MCP-capable assistants (or any client that prefers typed tools over filesystem/CLI access), `openkb-mcp` starts a stdio MCP server exposing `list_taxonomy` (semantic browsing of concepts/entities) and `search_wiki` (tiered BM25 search over summaries/sources — see "Query & Chat" above for what "tiered" means). No index cache: both tools rebuild fresh on every call, same as the CLI.
+For MCP-capable assistants (or any client that prefers typed tools over filesystem/CLI access), `openkb-mcp` starts a stdio MCP server exposing:
+
+- `list_taxonomy` / `list_documents` — semantic browsing of concepts/entities and summaries/explorations, each with their one-line brief.
+- `get_content` — read wiki content by slug across all seven content kinds (concept/entity/summary/exploration/source/report/index); omit `kind` to search all of them and get one entry per match.
+- `search_wiki` — tiered BM25 search over briefs/summaries/sources/explorations (see "Query & Chat" above for what "tiered" means).
+- `get_status` — the active KB's absolute path and content counts (the only way to learn the KB's absolute path without shell access, since every other tool returns wiki-root-relative paths).
+- `list_kbs` — every KB this server can address via the `kb` parameter.
+
+No index cache: every tool rebuilds its underlying index fresh on every call, same as the CLI.
+
+Every tool accepts an optional `kb` parameter (a registered KB name/alias, or an absolute KB root path) so one server process can serve multiple knowledge bases — omit it to use the KB resolved from the server's working directory or global default (today's behavior):
 
 ```json
 {
