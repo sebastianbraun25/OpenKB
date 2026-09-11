@@ -7,18 +7,42 @@ tested in isolation without requiring the openai-agents runtime.
 
 from __future__ import annotations
 
-import contextlib
 import json as _json
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Literal
 
-from openkb import frontmatter
+# Re-exported for backward compatibility — these used to be defined directly
+# in this module; see openkb.agent.content's docstring for why they moved.
+from openkb.agent.content import (
+    ContentEntry as ContentEntry,
+)
+from openkb.agent.content import (
+    DocumentItem as DocumentItem,
+)
+from openkb.agent.content import (
+    KbStatus as KbStatus,
+)
+from openkb.agent.content import (
+    TaxonomyItem as TaxonomyItem,
+)
+from openkb.agent.content import (
+    _kind_and_slug_from_path,
+)
+from openkb.agent.content import (
+    get_content as get_content,
+)
+from openkb.agent.content import (
+    get_kb_status as get_kb_status,
+)
+from openkb.agent.content import (
+    list_documents as list_documents,
+)
+from openkb.agent.content import (
+    list_taxonomy_items as list_taxonomy_items,
+)
+from openkb.agent.content import (
+    parse_pages as parse_pages,
+)
 from openkb.locks import atomic_write_text
-
-# Maps a taxonomy "kind" to its wiki subdirectory. Single source of truth for
-# list_taxonomy_items/get_taxonomy_item below.
-_TAXONOMY_DIRS: dict[str, str] = {"concept": "concepts", "entity": "entities"}
 
 
 def list_wiki_files(directory: str, wiki_root: str) -> str:
@@ -55,6 +79,18 @@ def read_wiki_file(path: str, wiki_root: str) -> str:
     Returns:
         File contents as a string, or ``"File not found: {path}"`` if missing.
     """
+    mapped = _kind_and_slug_from_path(path)
+    if mapped is not None:
+        kind, slug = mapped
+        entry = get_content(slug, wiki_root, kind=kind)[0]
+        if entry.error is not None:
+            return entry.error
+        return entry.content or ""
+
+    # Defensive fallback for anything outside get_content's 7 known kinds
+    # (path traversal, or a path shape the current wiki schema doesn't
+    # produce) — kept so this function's behavior never regresses for an
+    # unexpected path, even though every real wiki page maps cleanly above.
     root = Path(wiki_root).resolve()
     full_path = (root / path).resolve()
     if not full_path.is_relative_to(root):
@@ -62,40 +98,6 @@ def read_wiki_file(path: str, wiki_root: str) -> str:
     if not full_path.exists():
         return f"File not found: {path}"
     return full_path.read_text(encoding="utf-8")
-
-
-def parse_pages(pages: str) -> list[int]:
-    """Parse a page specification string into a sorted, deduplicated list of page numbers.
-
-    Args:
-        pages: Page spec such as ``"3-5,7,10-12"``.
-
-    Returns:
-        Sorted list of positive page numbers, e.g. ``[3, 4, 5, 7, 10, 11, 12]``.
-    """
-    result: set[int] = set()
-    for part in pages.split(","):
-        part = part.strip()
-        if "-" in part:
-            # Handle ranges like "3-5"; also handle negative numbers by only
-            # splitting on the first "-" that follows a digit.
-            segments = part.split("-")
-            # Re-join to handle leading negatives: segments[0] may be empty
-            # if part starts with "-".  We just try to parse start/end.
-            # Silently skip malformed segments — parse_pages is a tolerant
-            # parser by design (user-supplied page specs may contain typos).
-            with contextlib.suppress(ValueError):
-                if len(segments) == 2:
-                    start, end = int(segments[0]), int(segments[1])
-                    result.update(range(start, end + 1))
-                elif len(segments) == 3 and segments[0] == "":
-                    # e.g. "-1" split gives ['', '1']
-                    result.add(-int(segments[1]))
-                # More complex cases (e.g. negative range) are ignored.
-        else:
-            with contextlib.suppress(ValueError):
-                result.add(int(part))
-    return sorted(n for n in result if n > 0)
 
 
 def get_wiki_page_content(doc_name: str, pages: str, wiki_root: str) -> str:
@@ -112,131 +114,15 @@ def get_wiki_page_content(doc_name: str, pages: str, wiki_root: str) -> str:
 
     Returns:
         Formatted page content, or an error message string.
+
+    Delegates to :func:`get_content` (``kind="source"``) — kept as a thin,
+    backward-compatible wrapper since (unlike ``get_taxonomy_item``) this
+    function predates the unified ``get_content`` and is already released.
     """
-    root = Path(wiki_root).resolve()
-    target = (root / "sources" / f"{doc_name}.json").resolve()
-    if not target.is_relative_to(root):
-        return "Access denied: path escapes wiki root."
-    if not target.exists():
-        return f"File not found: sources/{doc_name}.json"
-
-    data = _json.loads(target.read_text(encoding="utf-8"))
-    requested = set(parse_pages(pages))
-    matches = [entry for entry in data if entry.get("page") in requested]
-
-    if not matches:
-        return f"No content found for pages {pages} in {doc_name}."
-
-    parts: list[str] = []
-    for entry in matches:
-        page_num = entry["page"]
-        content = entry.get("content", "")
-        block = f"[Page {page_num}]\n{content}"
-        images = entry.get("images")
-        if images:
-            paths = ", ".join(img["path"] for img in images if "path" in img)
-            if paths:
-                block += f"\n[Images: {paths}]"
-        parts.append(block)
-
-    return "\n\n".join(parts) + "\n\n"
-
-
-@dataclass(frozen=True)
-class TaxonomyItem:
-    """One persisted concept or entity page (never a pending candidate).
-
-    ``PendingTopicsStore`` (see ``openkb.pending``) buffers not-yet-paged
-    concept/entity candidates separately from the compiled ``.md`` pages
-    under ``concepts/``/``entities/`` — this dataclass, and
-    :func:`list_taxonomy_items`, only ever surface the latter, so a caller
-    never sees an in-progress candidate as if it were a real page.
-    """
-
-    kind: Literal["concept", "entity"]
-    slug: str
-    path: str  # wiki-root-relative, e.g. "concepts/attention.md"
-    brief: str
-    # Entity type (e.g. "person", "organization"); always None for concepts.
-    type: str | None = None
-
-
-def list_taxonomy_items(wiki_root: str, kind: str | None = None) -> list[TaxonomyItem]:
-    """List persisted concept and/or entity pages with their one-line briefs.
-
-    Intended as the first step of the search strategy: browse this compact,
-    semantically-scannable list and let the caller (an LLM) pick the
-    relevant slug(s) by meaning — this is deliberately not a keyword search
-    (see ``search_wiki`` for that, over summaries/sources only).
-
-    Args:
-        wiki_root: Absolute path to the wiki root directory.
-        kind: Restrict to ``"concept"`` or ``"entity"``; ``None`` returns both.
-
-    Returns:
-        Items sorted by kind, then slug. Empty list if the KB has neither
-        directory yet or both are empty.
-
-    Raises:
-        ValueError: *kind* is neither ``None``, ``"concept"``, nor ``"entity"``.
-    """
-    root = Path(wiki_root).resolve()
-    kinds = [kind] if kind else ["concept", "entity"]
-    for k in kinds:
-        if k not in _TAXONOMY_DIRS:
-            raise ValueError(f"Unknown kind {k!r}; expected 'concept' or 'entity'.")
-
-    items: list[TaxonomyItem] = []
-    for k in kinds:
-        directory = root / _TAXONOMY_DIRS[k]
-        if not directory.is_dir():
-            continue
-        for md_file in sorted(directory.glob("*.md")):
-            text = md_file.read_text(encoding="utf-8")
-            fm = frontmatter.parse(text)
-            brief = frontmatter.resolve_description(fm)
-            etype = None
-            if k == "entity":
-                etype = str(fm.get("type") or "").strip().lower() or "other"
-            items.append(
-                TaxonomyItem(
-                    kind=k,  # type: ignore[arg-type]  # validated against _TAXONOMY_DIRS above
-                    slug=md_file.stem,
-                    path=f"{_TAXONOMY_DIRS[k]}/{md_file.name}",
-                    brief=brief,
-                    type=etype,
-                )
-            )
-    return items
-
-
-def get_taxonomy_item(slug: str, wiki_root: str, kind: str | None = None) -> str:
-    """Read a persisted concept or entity page's full Markdown content.
-
-    Args:
-        slug: Page slug (filename without ``.md``), e.g. ``"attention"``.
-        wiki_root: Absolute path to the wiki root directory.
-        kind: ``"concept"`` or ``"entity"`` to disambiguate a same-named
-            slug; ``None`` checks ``concepts/`` first, then ``entities/``.
-
-    Returns:
-        Full file content, or a "not found" message if no match exists in
-        the requested (or either) directory.
-
-    Raises:
-        ValueError: *kind* is neither ``None``, ``"concept"``, nor ``"entity"``.
-    """
-    root = Path(wiki_root).resolve()
-    kinds = [kind] if kind else ["concept", "entity"]
-    for k in kinds:
-        if k not in _TAXONOMY_DIRS:
-            raise ValueError(f"Unknown kind {k!r}; expected 'concept' or 'entity'.")
-
-    for k in kinds:
-        path = (root / _TAXONOMY_DIRS[k] / f"{slug}.md").resolve()
-        if path.is_relative_to(root) and path.exists():
-            return path.read_text(encoding="utf-8")
-    return f"Taxonomy item not found: {slug}"
+    entry = get_content(doc_name, wiki_root, kind="source", pages=pages)[0]
+    if entry.error is not None:
+        return entry.error
+    return entry.content or ""
 
 
 def search_wiki(query: str, wiki_root: str, top_k: int = 5) -> str:
