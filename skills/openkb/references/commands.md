@@ -19,12 +19,14 @@ Resolution: walks up from cwd, then falls back to `openkb use`'s
 global default. Empty case prints "No knowledge base found. Run
 `openkb init` first." — stop and tell the user; don't try to read.
 
-## `openkb list`
+## `openkb list` (deprecated)
 
-Documents + concepts table. `Type` is mapped via `_TYPE_DISPLAY_MAP`:
-long PDFs show as `pageindex`, everything else as `short` (the raw
-file extension is internal and not exposed). `Pages` only populated
-for long PDFs.
+Documents + concepts/summaries/entities/reports lists, no briefs or
+`--json`. Prefer `list-taxonomy`/`list-documents` below — kept for
+existing scripts. `Type` is mapped via `_TYPE_DISPLAY_MAP`: long PDFs
+show as `pageindex`, everything else as `short` (the raw file
+extension is internal and not exposed). `Pages` only populated for
+long PDFs.
 
 ```
 $ openkb list
@@ -37,6 +39,27 @@ Summaries (N):
 Concepts (N):
   - attention
 ```
+
+## `openkb list-taxonomy [--kind concept|entity] [--json]`
+
+Persisted concept/entity pages with one-line briefs — semantic
+browsing, not keyword search. Never includes not-yet-paged pending
+candidates. `--json` gives `[{kind, slug, path, brief, type}, ...]`.
+
+## `openkb list-documents [--kind summary|exploration] [--json]`
+
+Same shape as `list-taxonomy`, for summaries (one per ingested
+document) and explorations (saved `query --save` answers — `brief` is
+the originally-asked question). `--json` gives `[{kind, slug, path,
+brief}, ...]`.
+
+## `openkb search "<term>" [--scope briefs,summaries,sources,explorations] [--json]`
+
+Tiered BM25 keyword search — never covers concepts/entities (use
+`list-taxonomy` for those). Each tier is scored independently; a
+`sources` hit may carry a `[line N]`/`[page N]` locator naming the
+exact spot to read next. `--json` gives `{tier: [{path, title, score,
+snippet, locator}, ...], ...}`.
 
 ## `openkb query "<question>"`
 
