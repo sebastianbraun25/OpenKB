@@ -11,14 +11,14 @@ improve relative to index-only navigation, never regress.
 
 Concepts and entities are deliberately excluded from full-text search (see
 :class:`TieredWikiSearch` below) — they are found by semantic browsing
-(``list_taxonomy_items``/``get_taxonomy_item`` in ``agent.tools``), not
-keyword search, so :class:`WikiFullTextIndex` (kept for backward
-compatibility with the original single-tier ``search_wiki`` tool) and
-:class:`TieredWikiSearch` cover different, non-overlapping surfaces:
+(``list_taxonomy_items``/``get_content`` in ``agent.tools``), not keyword
+search, so :class:`WikiFullTextIndex` (kept for backward compatibility with
+the original single-tier ``search_wiki`` tool) and :class:`TieredWikiSearch`
+cover different, non-overlapping surfaces:
 
 - :class:`WikiFullTextIndex` — the original combined BM25 index over
   ``concepts/`` + ``entities/`` + ``summaries/`` (:data:`PAGE_CONTENT_DIRS`).
-- :class:`TieredWikiSearch` — three independent BM25 tiers, each scoped to a
+- :class:`TieredWikiSearch` — four independent BM25 tiers, each scoped to a
   different part of a document's lifecycle so a query only "wastes" recall
   budget on the granularity it's actually likely to match at:
   1. ``briefs``   — one-line ``description``/``brief`` frontmatter per
@@ -32,6 +32,11 @@ compatibility with the original single-tier ``search_wiki`` tool) and
      can point at an exact page via a :class:`Locator` instead of forcing a
      re-score over an entire long document). Covers details that never make
      it into a summary at all (creation dates, authors, exact field names).
+  4. ``explorations`` — full body of ``explorations/*.md`` (saved
+     ``openkb query --save`` answers). Its own tier rather than folded into
+     ``summaries`` — an exploration is a previously-synthesized answer, not
+     a document summary, and keeping it a separate tier means a hit stays
+     unambiguously labeled as one or the other by which tier surfaced it.
 
 No new dependency: OpenKB pins dependencies exactly and vets each one
 deliberately (see ``pyproject.toml``), and BM25 over a few hundred wiki pages
@@ -60,7 +65,7 @@ _B = 0.75
 _SNIPPET_RADIUS = 80  # characters of context on each side of the first match
 
 # Valid `scope` values for TieredWikiSearch.search() — one BM25 tier each.
-TIERED_SCOPES = ("briefs", "summaries", "sources")
+TIERED_SCOPES = ("briefs", "summaries", "sources", "explorations")
 
 
 def _tokenize(text: str) -> list[str]:
@@ -315,6 +320,34 @@ def _build_summary_pages(wiki_root: Path) -> list[_IndexedPage]:
     return pages
 
 
+def _build_exploration_pages(wiki_root: Path) -> list[_IndexedPage]:
+    """One document per ``explorations/*.md``, text = full saved-answer body.
+
+    Its own independent tier — not merged into ``summaries``/``briefs`` —
+    so a hit here is unambiguously a previously-saved query answer rather
+    than a document summary, even though both are searched the same way
+    (full body, BM25). Title is the original saved ``query:`` frontmatter
+    value (explorations are freeform answers with no "# heading"
+    convention to fall back on as reliably as summaries/sources have).
+    """
+    explorations_dir = wiki_root / "explorations"
+    if not explorations_dir.is_dir():
+        return []
+    pages: list[_IndexedPage] = []
+    for md_file in sorted(explorations_dir.glob("*.md")):
+        text = md_file.read_text(encoding="utf-8")
+        body = frontmatter.body_only(text)
+        tokens = _tokenize(body)
+        if not tokens:
+            continue
+        query = str(frontmatter.parse(text).get("query") or "").strip()
+        title = query or _extract_title(text) or md_file.stem
+        pages.append(
+            _IndexedPage(path=f"explorations/{md_file.name}", title=title, text=body, tokens=tokens)
+        )
+    return pages
+
+
 def _build_source_pages(wiki_root: Path) -> list[_IndexedPage]:
     """Sources tier: ``sources/*.md`` (whole file) + ``sources/*.json`` (per page).
 
@@ -383,10 +416,11 @@ def _index_pageindex_source(src_file: Path) -> list[_IndexedPage]:
 
 
 class TieredWikiSearch:
-    """Three independent BM25 tiers over ``summaries/`` and ``sources/``.
+    """Four independent BM25 tiers over ``summaries/``, ``sources/``, and
+    ``explorations/``.
 
     Concepts and entities are intentionally out of scope here — they are
-    browsed semantically via ``list_taxonomy_items``/``get_taxonomy_item``
+    browsed semantically via ``list_taxonomy_items``/``get_content``
     (``agent.tools``), not keyword-searched. Rebuilt fresh on construction,
     same no-cache rationale as :class:`WikiFullTextIndex` (see module
     docstring); cheap at the wiki sizes this pattern targets.
@@ -398,6 +432,7 @@ class TieredWikiSearch:
             "briefs": _BM25Scorer(_build_brief_pages(wiki_root)),
             "summaries": _BM25Scorer(_build_summary_pages(wiki_root)),
             "sources": _BM25Scorer(_build_source_pages(wiki_root)),
+            "explorations": _BM25Scorer(_build_exploration_pages(wiki_root)),
         }
 
     def search(
