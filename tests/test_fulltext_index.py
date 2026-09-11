@@ -216,7 +216,7 @@ class TestTieredWikiSearchSources:
 
 
 class TestTieredWikiSearchScope:
-    def test_default_scope_searches_all_three_tiers(self, tmp_path):
+    def test_default_scope_searches_all_four_tiers(self, tmp_path):
         _write(
             tmp_path,
             "summaries",
@@ -224,13 +224,20 @@ class TestTieredWikiSearchScope:
             '---\ndescription: "keyword brief"\n---\n\n# Doc\n\nkeyword body.',
         )
         _write(tmp_path, "sources", "doc.md", "keyword raw source.")
+        _write(
+            tmp_path,
+            "explorations",
+            "q1.md",
+            '---\nquery: "keyword question"\n---\n\nkeyword answer body.',
+        )
 
         result = TieredWikiSearch(str(tmp_path)).search("keyword")
 
-        assert set(result.keys()) == {"briefs", "summaries", "sources"}
+        assert set(result.keys()) == {"briefs", "summaries", "sources", "explorations"}
         assert len(result["briefs"]) == 1
         assert len(result["summaries"]) == 1
         assert len(result["sources"]) == 1
+        assert len(result["explorations"]) == 1
 
     def test_concepts_and_entities_are_never_searched(self, tmp_path):
         _write(tmp_path, "concepts", "c.md", "# Concept\n\nkeyword concept content.")
@@ -241,6 +248,28 @@ class TestTieredWikiSearchScope:
         assert result["briefs"] == []
         assert result["summaries"] == []
         assert result["sources"] == []
+        assert result["explorations"] == []
+
+    def test_explorations_is_its_own_tier_not_merged_with_summaries(self, tmp_path):
+        _write(
+            tmp_path,
+            "summaries",
+            "doc.md",
+            '---\ndescription: "keyword brief"\n---\n\n# Doc\n\nkeyword body.',
+        )
+        _write(
+            tmp_path,
+            "explorations",
+            "q1.md",
+            '---\nquery: "keyword question"\n---\n\nkeyword answer body.',
+        )
+
+        result = TieredWikiSearch(str(tmp_path)).search("keyword", scope=["explorations"])
+
+        assert set(result.keys()) == {"explorations"}
+        assert len(result["explorations"]) == 1
+        assert result["explorations"][0].path == "explorations/q1.md"
+        assert result["explorations"][0].title == "keyword question"
 
     def test_invalid_scope_raises_value_error(self, tmp_path):
         import pytest
@@ -251,4 +280,4 @@ class TestTieredWikiSearchScope:
     def test_empty_wiki_returns_empty_lists_for_all_tiers(self, tmp_path):
         result = TieredWikiSearch(str(tmp_path)).search("anything")
 
-        assert result == {"briefs": [], "summaries": [], "sources": []}
+        assert result == {"briefs": [], "summaries": [], "sources": [], "explorations": []}

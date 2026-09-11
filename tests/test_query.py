@@ -17,9 +17,9 @@ class TestBuildQueryAgent:
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
         assert agent.name == "wiki-query"
 
-    def test_agent_has_five_tools(self, tmp_path):
+    def test_agent_has_six_tools(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
-        assert len(agent.tools) == 5
+        assert len(agent.tools) == 6
 
     def test_agent_tool_names(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
@@ -27,6 +27,7 @@ class TestBuildQueryAgent:
         assert "read_file" in names
         assert "get_page_content" in names
         assert "list_taxonomy" in names
+        assert "list_documents" in names
         assert "search_wiki" in names
         assert "get_image" in names
 
