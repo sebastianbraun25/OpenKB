@@ -9,9 +9,16 @@ from __future__ import annotations
 
 import contextlib
 import json as _json
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
+from openkb import frontmatter
 from openkb.locks import atomic_write_text
+
+# Maps a taxonomy "kind" to its wiki subdirectory. Single source of truth for
+# list_taxonomy_items/get_taxonomy_item below.
+_TAXONOMY_DIRS: dict[str, str] = {"concept": "concepts", "entity": "entities"}
 
 
 def list_wiki_files(directory: str, wiki_root: str) -> str:
@@ -133,6 +140,103 @@ def get_wiki_page_content(doc_name: str, pages: str, wiki_root: str) -> str:
         parts.append(block)
 
     return "\n\n".join(parts) + "\n\n"
+
+
+@dataclass(frozen=True)
+class TaxonomyItem:
+    """One persisted concept or entity page (never a pending candidate).
+
+    ``PendingTopicsStore`` (see ``openkb.pending``) buffers not-yet-paged
+    concept/entity candidates separately from the compiled ``.md`` pages
+    under ``concepts/``/``entities/`` — this dataclass, and
+    :func:`list_taxonomy_items`, only ever surface the latter, so a caller
+    never sees an in-progress candidate as if it were a real page.
+    """
+
+    kind: Literal["concept", "entity"]
+    slug: str
+    path: str  # wiki-root-relative, e.g. "concepts/attention.md"
+    brief: str
+    # Entity type (e.g. "person", "organization"); always None for concepts.
+    type: str | None = None
+
+
+def list_taxonomy_items(wiki_root: str, kind: str | None = None) -> list[TaxonomyItem]:
+    """List persisted concept and/or entity pages with their one-line briefs.
+
+    Intended as the first step of the search strategy: browse this compact,
+    semantically-scannable list and let the caller (an LLM) pick the
+    relevant slug(s) by meaning — this is deliberately not a keyword search
+    (see ``search_wiki`` for that, over summaries/sources only).
+
+    Args:
+        wiki_root: Absolute path to the wiki root directory.
+        kind: Restrict to ``"concept"`` or ``"entity"``; ``None`` returns both.
+
+    Returns:
+        Items sorted by kind, then slug. Empty list if the KB has neither
+        directory yet or both are empty.
+
+    Raises:
+        ValueError: *kind* is neither ``None``, ``"concept"``, nor ``"entity"``.
+    """
+    root = Path(wiki_root).resolve()
+    kinds = [kind] if kind else ["concept", "entity"]
+    for k in kinds:
+        if k not in _TAXONOMY_DIRS:
+            raise ValueError(f"Unknown kind {k!r}; expected 'concept' or 'entity'.")
+
+    items: list[TaxonomyItem] = []
+    for k in kinds:
+        directory = root / _TAXONOMY_DIRS[k]
+        if not directory.is_dir():
+            continue
+        for md_file in sorted(directory.glob("*.md")):
+            text = md_file.read_text(encoding="utf-8")
+            fm = frontmatter.parse(text)
+            brief = frontmatter.resolve_description(fm)
+            etype = None
+            if k == "entity":
+                etype = str(fm.get("type") or "").strip().lower() or "other"
+            items.append(
+                TaxonomyItem(
+                    kind=k,  # type: ignore[arg-type]  # validated against _TAXONOMY_DIRS above
+                    slug=md_file.stem,
+                    path=f"{_TAXONOMY_DIRS[k]}/{md_file.name}",
+                    brief=brief,
+                    type=etype,
+                )
+            )
+    return items
+
+
+def get_taxonomy_item(slug: str, wiki_root: str, kind: str | None = None) -> str:
+    """Read a persisted concept or entity page's full Markdown content.
+
+    Args:
+        slug: Page slug (filename without ``.md``), e.g. ``"attention"``.
+        wiki_root: Absolute path to the wiki root directory.
+        kind: ``"concept"`` or ``"entity"`` to disambiguate a same-named
+            slug; ``None`` checks ``concepts/`` first, then ``entities/``.
+
+    Returns:
+        Full file content, or a "not found" message if no match exists in
+        the requested (or either) directory.
+
+    Raises:
+        ValueError: *kind* is neither ``None``, ``"concept"``, nor ``"entity"``.
+    """
+    root = Path(wiki_root).resolve()
+    kinds = [kind] if kind else ["concept", "entity"]
+    for k in kinds:
+        if k not in _TAXONOMY_DIRS:
+            raise ValueError(f"Unknown kind {k!r}; expected 'concept' or 'entity'.")
+
+    for k in kinds:
+        path = (root / _TAXONOMY_DIRS[k] / f"{slug}.md").resolve()
+        if path.is_relative_to(root) and path.exists():
+            return path.read_text(encoding="utf-8")
+    return f"Taxonomy item not found: {slug}"
 
 
 def search_wiki(query: str, wiki_root: str, top_k: int = 5) -> str:
