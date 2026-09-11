@@ -343,6 +343,21 @@ gemini skills install https://github.com/VectifyAI/OpenKB.git --path skills/open
 
 The skill is read-only. It won't run `openkb add`, `remove`, or `lint --fix` without you asking. See [`skills/openkb/SKILL.md`](skills/openkb/SKILL.md) for the full instruction set.
 
+### Using with an MCP client
+
+For MCP-capable assistants (or any client that prefers typed tools over filesystem/CLI access), `openkb-mcp` starts a stdio MCP server exposing `list_taxonomy` (semantic browsing of concepts/entities) and `search_wiki` (tiered BM25 search over summaries/sources — see "Query & Chat" above for what "tiered" means). No index cache: both tools rebuild fresh on every call, same as the CLI.
+
+```json
+{
+  "mcpServers": {
+    "openkb": {
+      "command": "openkb-mcp",
+      "cwd": "/path/to/your/kb"
+    }
+  }
+}
+```
+
 # REST API
 
 OpenKB ships a FastAPI service for HTTP clients. Install with `pip install -e ".[web]"`, then start with `python -m openkb.api`. The interactive API reference is at [`/docs`](http://127.0.0.1:7566/docs) (importable into Postman).
