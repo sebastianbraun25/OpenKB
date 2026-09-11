@@ -7,6 +7,7 @@ from openkb.agent.tools import (
     artifact_event_from_write,
     get_taxonomy_item,
     get_wiki_page_content,
+    list_taxonomy,
     list_taxonomy_items,
     list_wiki_files,
     parse_pages,
@@ -332,7 +333,20 @@ def test_artifact_event_none_for_bad_json():
 
 
 class TestSearchWiki:
-    def test_finds_matching_page(self, tmp_path):
+    def test_finds_matching_page_in_sources(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "sources").mkdir()
+        (tmp_path / "sources" / "cnn.md").write_text(
+            "# Convolutional Neural Networks\n\nDropout regularization prevents overfitting."
+        )
+
+        result = search_wiki("dropout regularization", wiki_root)
+
+        assert "[[sources/cnn]]" in result
+        assert "Convolutional Neural Networks" in result
+        assert "## sources" in result
+
+    def test_concepts_and_entities_are_not_searched(self, tmp_path):
         wiki_root = str(tmp_path)
         (tmp_path / "concepts").mkdir()
         (tmp_path / "concepts" / "cnn.md").write_text(
@@ -341,13 +355,12 @@ class TestSearchWiki:
 
         result = search_wiki("dropout regularization", wiki_root)
 
-        assert "[[concepts/cnn]]" in result
-        assert "Convolutional Neural Networks" in result
+        assert result == "No matching pages found."
 
     def test_no_matches_returns_message(self, tmp_path):
         wiki_root = str(tmp_path)
-        (tmp_path / "concepts").mkdir()
-        (tmp_path / "concepts" / "cnn.md").write_text("# CNN\n\nSomething else entirely.")
+        (tmp_path / "sources").mkdir()
+        (tmp_path / "sources" / "cnn.md").write_text("# CNN\n\nSomething else entirely.")
 
         result = search_wiki("nonexistent_keyword_xyz", wiki_root)
 
@@ -355,13 +368,42 @@ class TestSearchWiki:
 
     def test_respects_top_k(self, tmp_path):
         wiki_root = str(tmp_path)
-        (tmp_path / "entities").mkdir()
+        (tmp_path / "sources").mkdir()
         for i in range(5):
-            (tmp_path / "entities" / f"e{i}.md").write_text(f"# Entity {i}\n\nkeyword {i}.")
+            (tmp_path / "sources" / f"e{i}.md").write_text(f"# Entity {i}\n\nkeyword {i}.")
 
         result = search_wiki("keyword", wiki_root, top_k=2)
 
-        assert result.count("[[entities/") == 2
+        assert result.count("[[sources/") == 2
+
+    def test_scope_restricts_to_requested_tiers(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "summaries").mkdir()
+        (tmp_path / "summaries" / "doc.md").write_text(
+            '---\ndescription: "keyword brief"\n---\n\n# Doc\n\nkeyword body.'
+        )
+        (tmp_path / "sources").mkdir()
+        (tmp_path / "sources" / "doc.md").write_text("keyword raw source.")
+
+        result = search_wiki("keyword", wiki_root, scope=["sources"])
+
+        assert "## sources" in result
+        assert "## briefs" not in result
+        assert "## summaries" not in result
+
+    def test_invalid_scope_returns_error_message(self, tmp_path):
+        result = search_wiki("keyword", str(tmp_path), scope=["not-a-real-tier"])
+
+        assert "Unknown scope" in result
+
+    def test_result_includes_locator_for_source_hit(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "sources").mkdir()
+        (tmp_path / "sources" / "notes.md").write_text("Line one.\nkeyword on line two.")
+
+        result = search_wiki("keyword", wiki_root, scope=["sources"])
+
+        assert "[line 2]" in result
 
 
 # ---------------------------------------------------------------------------
@@ -477,3 +519,45 @@ class TestGetTaxonomyItem:
         result = get_taxonomy_item("../../etc/passwd", str(tmp_path))
 
         assert result == "Taxonomy item not found: ../../etc/passwd"
+
+
+# ---------------------------------------------------------------------------
+# list_taxonomy (agent-facing text formatter over list_taxonomy_items)
+# ---------------------------------------------------------------------------
+
+
+class TestListTaxonomy:
+    def test_formats_concepts_and_entities_as_wikilinks(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "attention.md").write_text(
+            '---\ndescription: "How attention works"\n---\n\n# Attention\n\nBody.'
+        )
+        (tmp_path / "entities").mkdir()
+        (tmp_path / "entities" / "acme.md").write_text(
+            '---\ntype: organization\ndescription: "A company"\n---\n\n# Acme\n\nBody.'
+        )
+
+        result = list_taxonomy(wiki_root)
+
+        assert "[[concepts/attention]]" in result
+        assert "How attention works" in result
+        assert "[[entities/acme]] (organization)" in result
+        assert "A company" in result
+
+    def test_kind_filter(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "c.md").write_text("# C\n\nBody.")
+        (tmp_path / "entities").mkdir()
+        (tmp_path / "entities" / "e.md").write_text("# E\n\nBody.")
+
+        result = list_taxonomy(wiki_root, kind="concept")
+
+        assert "concepts/c" in result
+        assert "entities/e" not in result
+
+    def test_empty_taxonomy_returns_message(self, tmp_path):
+        result = list_taxonomy(str(tmp_path))
+
+        assert result == "No concepts or entities found."
