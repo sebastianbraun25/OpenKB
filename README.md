@@ -345,13 +345,15 @@ The skill is read-only. It won't run `openkb add`, `remove`, or `lint --fix` wit
 
 For MCP-capable assistants (or any client that prefers typed tools over filesystem/CLI access), `openkb-mcp` starts a stdio MCP server exposing:
 
-- `list_taxonomy` / `list_documents` — semantic browsing of concepts/entities and summaries/explorations, each with their one-line brief.
+- `list_taxonomy` / `list_documents` — semantic browsing of concepts/entities and summaries/explorations, each with their one-line brief. Support `offset`/`limit` pagination.
 - `get_content` — read wiki content by slug across all seven content kinds (concept/entity/summary/exploration/source/report/index); omit `kind` to search all of them and get one entry per match.
-- `search_wiki` — tiered BM25 search over briefs/summaries/sources/explorations (see "Query & Chat" above for what "tiered" means).
+- `search_wiki` — tiered BM25 search over briefs/summaries/sources/explorations (see "Query & Chat" above for what "tiered" means). `top_k` is the pagination knob (max results per tier).
 - `get_status` — the active KB's absolute path and content counts (the only way to learn the KB's absolute path without shell access, since every other tool returns wiki-root-relative paths).
 - `list_kbs` — every KB this server can address via the `kb` parameter.
 
 No index cache: every tool rebuilds its underlying index fresh on every call, same as the CLI.
+
+**Response size guard:** every tool's result is capped at ~5 KB (serialized). A result over that budget is never silently truncated — instead the tool returns `{"error": "result_too_large", "size_bytes": ..., "max_bytes": ..., "message": "..."}` explaining how to retry with a smaller page: a lower `limit`/higher `offset` for `list_taxonomy`/`list_documents`, a lower `top_k` or narrower `scope` for `search_wiki`, or a more specific `kind`/`pages` for `get_content`.
 
 Every tool accepts an optional `kb` parameter (a registered KB name/alias, or an absolute KB root path) so one server process can serve multiple knowledge bases — omit it to use the KB resolved from the server's working directory or global default (today's behavior):
 

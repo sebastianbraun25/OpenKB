@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from openkb.mcp_server import (
+    MAX_RESULT_BYTES,
     _resolve_kb,
     find_kb_dir,
     get_content_tool,
@@ -33,6 +34,25 @@ def _make_kb(tmp_path):
         '---\ndescription: "Overview"\n---\n\n# Doc\n\nDetails about field_xyz appear here.',
         encoding="utf-8",
     )
+    return tmp_path
+
+
+def _make_kb_with_many_concepts(tmp_path, count: int):
+    """Create a KB with *count* concept pages, each carrying a long brief.
+
+    Used to exercise the ~5 KB response-size guard deterministically,
+    independent of any single fixture's exact byte count.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".openkb").mkdir()
+    concepts_dir = tmp_path / "wiki" / "concepts"
+    concepts_dir.mkdir(parents=True)
+    long_brief = "x" * 200
+    for i in range(count):
+        (concepts_dir / f"concept-{i:03d}.md").write_text(
+            f'---\ndescription: "{long_brief}"\n---\n\n# Concept {i}\n\nBody.',
+            encoding="utf-8",
+        )
     return tmp_path
 
 
@@ -277,3 +297,96 @@ class TestMcpGetContent:
         result = get_content_tool("attention", kind="concept", kb=str(kb_dir))
 
         assert result[0]["error"] is None
+
+
+# ---------------------------------------------------------------------------
+# Response-size guard + pagination
+# ---------------------------------------------------------------------------
+
+
+class TestResultSizeGuard:
+    def test_list_taxonomy_returns_error_payload_when_over_budget(self, tmp_path, monkeypatch):
+        # Enough long-brief concepts to exceed MAX_RESULT_BYTES in one page.
+        _make_kb_with_many_concepts(tmp_path, count=50)
+        monkeypatch.chdir(tmp_path)
+
+        result = list_taxonomy()
+
+        assert isinstance(result, dict)
+        assert result["error"] == "result_too_large"
+        assert result["size_bytes"] > MAX_RESULT_BYTES
+        assert result["max_bytes"] == MAX_RESULT_BYTES
+        assert "limit" in result["message"]
+
+    def test_list_taxonomy_limit_keeps_result_under_budget(self, tmp_path, monkeypatch):
+        _make_kb_with_many_concepts(tmp_path, count=50)
+        monkeypatch.chdir(tmp_path)
+
+        result = list_taxonomy(limit=3)
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+
+    def test_list_taxonomy_offset_skips_leading_items(self, tmp_path, monkeypatch):
+        _make_kb_with_many_concepts(tmp_path, count=5)
+        monkeypatch.chdir(tmp_path)
+
+        first_two = list_taxonomy(limit=2, offset=0)
+        next_two = list_taxonomy(limit=2, offset=2)
+
+        assert [i["slug"] for i in first_two] == ["concept-000", "concept-001"]
+        assert [i["slug"] for i in next_two] == ["concept-002", "concept-003"]
+
+    def test_list_documents_limit_offset_pagination(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        (tmp_path / "wiki" / "summaries" / "doc2.md").write_text(
+            '---\ndescription: "Second"\n---\n\n# Doc2\n\nBody.', encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        page1 = list_documents_tool(limit=1, offset=0)
+        page2 = list_documents_tool(limit=1, offset=1)
+
+        assert len(page1) == 1
+        assert len(page2) == 1
+        assert page1[0]["slug"] != page2[0]["slug"]
+
+    def test_get_content_returns_error_payload_when_over_budget(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        huge_body = "y" * (MAX_RESULT_BYTES * 2)
+        (tmp_path / "wiki" / "summaries" / "huge.md").write_text(
+            f'---\ndescription: "Huge"\n---\n\n# Huge\n\n{huge_body}', encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = get_content_tool("huge", kind="summary")
+
+        assert isinstance(result, dict)
+        assert result["error"] == "result_too_large"
+        assert result["size_bytes"] > MAX_RESULT_BYTES
+
+    def test_search_wiki_returns_error_payload_when_over_budget(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        for i in range(50):
+            (tmp_path / "wiki" / "summaries" / f"doc{i}.md").write_text(
+                f'---\ndescription: "About field_xyz number {i}"\n---\n\n'
+                f"# Doc {i}\n\nDetails about field_xyz appear here, {'z' * 100}.",
+                encoding="utf-8",
+            )
+        monkeypatch.chdir(tmp_path)
+
+        result = search_wiki("field_xyz", top_k=50)
+
+        assert isinstance(result, dict)
+        assert result["error"] == "result_too_large"
+        assert result["size_bytes"] > MAX_RESULT_BYTES
+        assert "top_k" in result["message"]
+
+    def test_search_wiki_small_top_k_stays_under_budget(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        result = search_wiki("field_xyz", top_k=1)
+
+        assert "error" not in result
+        assert "summaries" in result
