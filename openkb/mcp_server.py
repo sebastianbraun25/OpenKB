@@ -28,9 +28,15 @@ new caching model just for this surface.
 Response size guard: every tool below caps its serialized result at
 ``MAX_RESULT_BYTES``. A result over budget is never silently truncated —
 that would look like the KB simply doesn't have more — instead the tool
-returns an ``"error": "result_too_large"`` info payload naming the actual
-size and how to split the request into smaller calls (a narrower filter, or
-``limit``/``offset`` pagination where offered). See ``_oversized_result``.
+returns an info payload naming the actual size and how to retry. For the
+``list_*`` tools (``list_kbs``/``list_taxonomy``/``list_documents``), where
+splitting by character or line makes no sense, the full item list is cut
+into fixed-size pages (:func:`_split_into_pages`) and the caller re-requests
+one page at a time via a 1-based ``page`` parameter — the same idea as
+``get_content``'s existing ``pages`` argument for a long source document,
+just a single page number over a *result listing* rather than a range over a
+document's own pre-existing pages. ``get_content``/``search_wiki`` instead
+narrow via their existing ``kind``/``pages``/``top_k``/``scope`` arguments.
 """
 
 from __future__ import annotations
@@ -59,15 +65,20 @@ def _result_size_bytes(result: object) -> int:
     return len(json.dumps(result, default=str, ensure_ascii=False).encode("utf-8"))
 
 
-def _oversized_result(size_bytes: int, hint: str) -> dict:
+def _oversized_result(size_bytes: int, hint: str, num_pages: int | None = None) -> dict:
     """Info payload returned instead of an over-budget tool result.
 
     Args:
         size_bytes: Actual serialized size of the result that was withheld.
         hint: Tool-specific guidance on how to split the request into
             smaller calls (which parameter to narrow or paginate with).
+        num_pages: For the ``list_*`` tools, the fixed page count computed
+            by :func:`_split_into_pages` — a structured field, not just
+            mentioned in ``message``, so a caller doesn't have to parse
+            prose to loop ``page=1..num_pages``. ``None`` for tools that
+            don't paginate by whole page (``get_content``/``search_wiki``).
     """
-    return {
+    result: dict = {
         "error": "result_too_large",
         "size_bytes": size_bytes,
         "max_bytes": MAX_RESULT_BYTES,
@@ -76,6 +87,9 @@ def _oversized_result(size_bytes: int, hint: str) -> dict:
             f"response limit. {hint}"
         ),
     }
+    if num_pages is not None:
+        result["num_pages"] = num_pages
+    return result
 
 
 def find_kb_dir(start: Path | None = None) -> Path | None:
@@ -156,58 +170,84 @@ def _wiki_root(kb: str | None = None) -> Path:
     return _resolve_kb(kb) / "wiki"
 
 
-def _paginate(items: list, offset: int, limit: int | None) -> tuple[list, int]:
-    """Slice *items* to one page; returns ``(page, total_count)``.
+def _split_into_pages(items: list[dict]) -> list[list[dict]]:
+    """Greedily pack *items* into fixed pages that each fit ``MAX_RESULT_BYTES``.
 
-    Args:
-        items: The full, unpaginated result list.
-        offset: Number of leading items to skip.
-        limit: Maximum items to return after *offset*; ``None`` means no cap
-            (still subject to the ``MAX_RESULT_BYTES`` guard below).
+    Deterministic for a given item list (same KB content -> same page
+    boundaries), so a caller can request ``page=2`` and reliably get the
+    same slice on a later call. A single pathological item bigger than the
+    whole budget still becomes its own (oversized) page rather than being
+    split mid-item — there is nothing smaller to fall back to.
     """
-    total = len(items)
-    page = items[offset : offset + limit] if limit is not None else items[offset:]
-    return page, total
+    pages: list[list[dict]] = []
+    current: list[dict] = []
+    for item in items:
+        candidate = current + [item]
+        if current and _result_size_bytes(candidate) > MAX_RESULT_BYTES:
+            pages.append(current)
+            current = [item]
+        else:
+            current = candidate
+    if current:
+        pages.append(current)
+    return pages
 
 
-def _guarded_list(
-    to_dict_all: list[dict], total: int, offset: int, limit: int | None, hint: str
-) -> list[dict] | dict:
-    """Return *to_dict_all* as-is, or an :func:`_oversized_result` info payload.
+def _paginate_list(items: list[dict], page: int | None, hint: str) -> list[dict] | dict:
+    """Return *items* whole, one fixed page of it, or an oversized-result info payload.
+
+    Mirrors ``get_content``'s ``pages`` argument, but for a *result listing*
+    rather than a long source document's own pages: a single 1-based page
+    number (not a range), and the pages are computed here rather than fixed
+    at indexing time. Splitting a listing by byte/line offset would cut mid
+    item; splitting into whole items per page does not.
 
     Args:
-        to_dict_all: The already-paginated (per *offset*/*limit*) list of
-            plain dicts to check and return.
-        total: Total item count before pagination (for the guidance message).
-        offset: The *offset* the caller passed (for the guidance message).
-        limit: The *limit* the caller passed (for the guidance message).
+        items: The full, unpaginated list of plain dicts.
+        page: 1-based page to return; ``None`` means "give me everything if
+            it fits, otherwise tell me how many pages there are."
         hint: Name of the listing, e.g. ``"list_taxonomy"`` (for the message).
     """
-    size = _result_size_bytes(to_dict_all)
+    size = _result_size_bytes(items)
     if size <= MAX_RESULT_BYTES:
-        return to_dict_all
-    page_size = limit if limit is not None else len(to_dict_all)
-    suggested = max(1, page_size // 2)
-    return _oversized_result(
-        size,
-        f"{hint} has {total} total item(s); {len(to_dict_all)} were requested "
-        f"(offset={offset}, limit={limit!r}). Retry with a smaller `limit` "
-        f"(e.g. limit={suggested}) and page through with `offset`.",
-    )
+        return items
+
+    pages = _split_into_pages(items)
+    num_pages = len(pages)
+    if page is None:
+        return _oversized_result(
+            size,
+            f"{hint} has {len(items)} total item(s), too large for one response. "
+            f"Split into {num_pages} page(s) — call again with page=1, then "
+            f"page=2, ... up to page={num_pages}.",
+            num_pages=num_pages,
+        )
+    if page < 1 or page > num_pages:
+        return _oversized_result(
+            size,
+            f"{hint} has {num_pages} page(s) total; page={page} is out of range. "
+            f"Call again with a page between 1 and {num_pages}.",
+            num_pages=num_pages,
+        )
+    return pages[page - 1]
 
 
 @mcp.tool()
-def list_kbs() -> list[dict] | dict:
+def list_kbs(page: int | None = None) -> list[dict] | dict:
     """List every KB this MCP server can address via the ``kb`` parameter.
+
+    Args:
+        page: 1-based page to return if the full listing is too large; omit
+            to get everything (or, if too large, a page count to choose from).
 
     Returns:
         One dict per registered KB (``name`` — pass as ``kb=name`` to any
         other tool — and ``path``, its absolute KB root directory), or, if
         the serialized result would exceed ~5 KB, a
-        ``{"error": "result_too_large", ...}`` payload.
+        ``{"error": "result_too_large", ...}`` payload naming the page count.
     """
     result = [{"name": name, "path": str(path)} for name, path in registered_kbs()]
-    return _guarded_list(result, len(result), offset=0, limit=None, hint="list_kbs")
+    return _paginate_list(result, page, hint="list_kbs")
 
 
 @mcp.tool()
@@ -244,7 +284,7 @@ def get_status(kb: str | None = None) -> dict:
 
 @mcp.tool()
 def list_taxonomy(
-    kind: str | None = None, offset: int = 0, limit: int | None = None, kb: str | None = None
+    kind: str | None = None, page: int | None = None, kb: str | None = None
 ) -> list[dict] | dict:
     """List persisted concept/entity pages with their one-line briefs.
 
@@ -254,9 +294,10 @@ def list_taxonomy(
 
     Args:
         kind: Restrict to "concept" or "entity"; omit for both.
-        offset: Number of leading items to skip (pagination).
-        limit: Maximum items to return after ``offset``; omit for no cap
-            (still subject to the response-size guard below).
+        page: 1-based page to return if the full listing is too large; omit
+            to get everything (or, if too large, a page count to choose
+            from). Mirrors ``get_content``'s ``pages`` idea, one page number
+            over this listing rather than a range over a document's pages.
         kb: Registered KB name/alias or absolute path; omit to use the KB
             resolved from the server's cwd or global default.
 
@@ -264,29 +305,28 @@ def list_taxonomy(
         One dict per item (``kind``, ``slug``, ``path``, ``brief``, and
         ``type`` — entity type, or ``None`` for concepts), or, if the
         serialized result would exceed ~5 KB, a
-        ``{"error": "result_too_large", ...}`` payload naming the actual
-        size and how to retry with a smaller ``limit``/``offset`` page.
+        ``{"error": "result_too_large", ...}`` payload naming the page count.
     """
     items = list_taxonomy_items(str(_wiki_root(kb)), kind=kind)
-    page, total = _paginate(items, offset, limit)
     result = [
         {"kind": i.kind, "slug": i.slug, "path": i.path, "brief": i.brief, "type": i.type}
-        for i in page
+        for i in items
     ]
-    return _guarded_list(result, total, offset, limit, hint="list_taxonomy")
+    return _paginate_list(result, page, hint="list_taxonomy")
 
 
 @mcp.tool(name="list_documents")
 def list_documents_tool(
-    kind: str | None = None, offset: int = 0, limit: int | None = None, kb: str | None = None
+    kind: str | None = None, page: int | None = None, kb: str | None = None
 ) -> list[dict] | dict:
     """List persisted summary/exploration pages with their one-line briefs.
 
     Args:
         kind: Restrict to "summary" or "exploration"; omit for both.
-        offset: Number of leading items to skip (pagination).
-        limit: Maximum items to return after ``offset``; omit for no cap
-            (still subject to the response-size guard below).
+        page: 1-based page to return if the full listing is too large; omit
+            to get everything (or, if too large, a page count to choose
+            from). Mirrors ``get_content``'s ``pages`` idea, one page number
+            over this listing rather than a range over a document's pages.
         kb: Registered KB name/alias or absolute path; omit to use the KB
             resolved from the server's cwd or global default.
 
@@ -294,13 +334,11 @@ def list_documents_tool(
         One dict per item (``kind``, ``slug``, ``path``, and ``brief`` — an
         exploration's brief is its originally-saved question), or, if the
         serialized result would exceed ~5 KB, a
-        ``{"error": "result_too_large", ...}`` payload naming the actual
-        size and how to retry with a smaller ``limit``/``offset`` page.
+        ``{"error": "result_too_large", ...}`` payload naming the page count.
     """
     items = list_documents(str(_wiki_root(kb)), kind=kind)
-    page, total = _paginate(items, offset, limit)
-    result = [{"kind": i.kind, "slug": i.slug, "path": i.path, "brief": i.brief} for i in page]
-    return _guarded_list(result, total, offset, limit, hint="list_documents")
+    result = [{"kind": i.kind, "slug": i.slug, "path": i.path, "brief": i.brief} for i in items]
+    return _paginate_list(result, page, hint="list_documents")
 
 
 def _content_entry_to_dict(entry: ContentEntry) -> dict:
