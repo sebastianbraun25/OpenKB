@@ -316,40 +316,58 @@ class TestResultSizeGuard:
         assert result["error"] == "result_too_large"
         assert result["size_bytes"] > MAX_RESULT_BYTES
         assert result["max_bytes"] == MAX_RESULT_BYTES
-        assert "limit" in result["message"]
+        assert result["num_pages"] > 1
+        assert "page" in result["message"]
 
-    def test_list_taxonomy_limit_keeps_result_under_budget(self, tmp_path, monkeypatch):
+    def test_list_taxonomy_page_returns_a_fixed_slice_under_budget(self, tmp_path, monkeypatch):
         _make_kb_with_many_concepts(tmp_path, count=50)
         monkeypatch.chdir(tmp_path)
 
-        result = list_taxonomy(limit=3)
+        result = list_taxonomy(page=1)
 
         assert isinstance(result, list)
-        assert len(result) == 3
+        assert len(result) > 0
+        assert len(result) < 50
 
-    def test_list_taxonomy_offset_skips_leading_items(self, tmp_path, monkeypatch):
-        _make_kb_with_many_concepts(tmp_path, count=5)
+    def test_list_taxonomy_pages_are_disjoint_and_cover_all_items(self, tmp_path, monkeypatch):
+        _make_kb_with_many_concepts(tmp_path, count=50)
         monkeypatch.chdir(tmp_path)
 
-        first_two = list_taxonomy(limit=2, offset=0)
-        next_two = list_taxonomy(limit=2, offset=2)
+        first_result = list_taxonomy()
+        assert isinstance(first_result, dict)
+        num_pages = first_result["num_pages"]
+        assert num_pages > 1
 
-        assert [i["slug"] for i in first_two] == ["concept-000", "concept-001"]
-        assert [i["slug"] for i in next_two] == ["concept-002", "concept-003"]
+        all_slugs: list[str] = []
+        for p in range(1, num_pages + 1):
+            page_result = list_taxonomy(page=p)
+            assert isinstance(page_result, list)
+            all_slugs.extend(i["slug"] for i in page_result)
 
-    def test_list_documents_limit_offset_pagination(self, tmp_path, monkeypatch):
+        assert sorted(all_slugs) == sorted(f"concept-{i:03d}" for i in range(50))
+
+    def test_list_taxonomy_out_of_range_page_returns_error(self, tmp_path, monkeypatch):
+        _make_kb_with_many_concepts(tmp_path, count=50)
+        monkeypatch.chdir(tmp_path)
+
+        result = list_taxonomy(page=9999)
+
+        assert isinstance(result, dict)
+        assert result["error"] == "result_too_large"
+        assert "out of range" in result["message"]
+
+    def test_list_documents_page_pagination(self, tmp_path, monkeypatch):
         _make_kb(tmp_path)
         (tmp_path / "wiki" / "summaries" / "doc2.md").write_text(
             '---\ndescription: "Second"\n---\n\n# Doc2\n\nBody.', encoding="utf-8"
         )
         monkeypatch.chdir(tmp_path)
 
-        page1 = list_documents_tool(limit=1, offset=0)
-        page2 = list_documents_tool(limit=1, offset=1)
+        # Both docs fit comfortably under budget - page=1 returns everything.
+        result = list_documents_tool(page=1)
 
-        assert len(page1) == 1
-        assert len(page2) == 1
-        assert page1[0]["slug"] != page2[0]["slug"]
+        assert isinstance(result, list)
+        assert len(result) == 2
 
     def test_get_content_returns_error_payload_when_over_budget(self, tmp_path, monkeypatch):
         _make_kb(tmp_path)
