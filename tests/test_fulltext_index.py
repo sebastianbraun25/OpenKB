@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from openkb.fulltext_index import Locator, TieredWikiSearch, WikiFullTextIndex
+from openkb.fulltext_index import Locator, TaxonomySearch, TieredWikiSearch, WikiFullTextIndex
 
 
 def _write(tmp_path, subdir, name, text):
@@ -281,3 +281,83 @@ class TestTieredWikiSearchScope:
         result = TieredWikiSearch(str(tmp_path)).search("anything")
 
         assert result == {"briefs": [], "summaries": [], "sources": [], "explorations": []}
+
+
+class TestTaxonomySearch:
+    def test_matches_brief_not_full_body(self, tmp_path):
+        _write(
+            tmp_path,
+            "concepts",
+            "attention.md",
+            '---\ndescription: "How attention works"\n---\n\n'
+            "# Attention\n\nBody text mentioning transformer_internal_xyz deep inside.",
+        )
+
+        by_brief = TaxonomySearch(str(tmp_path)).search("attention")
+        by_body = TaxonomySearch(str(tmp_path)).search("transformer_internal_xyz")
+
+        assert len(by_brief) == 1
+        assert by_brief[0].path == "concepts/attention.md"
+        assert by_body == []
+
+    def test_matches_slug_when_brief_is_unrelated(self, tmp_path):
+        _write(
+            tmp_path,
+            "concepts",
+            "gradient-descent.md",
+            '---\ndescription: "An optimization method"\n---\n\n# Gradient Descent\n\nBody.',
+        )
+
+        result = TaxonomySearch(str(tmp_path)).search("gradient descent")
+
+        assert len(result) == 1
+        assert result[0].slug == "gradient-descent"
+
+    def test_kind_filter_restricts_index(self, tmp_path):
+        _write(
+            tmp_path,
+            "concepts",
+            "attention.md",
+            '---\ndescription: "How attention works"\n---\n\n# Attention\n\nBody.',
+        )
+        _write(
+            tmp_path,
+            "entities",
+            "attention-corp.md",
+            '---\ndescription: "A company"\ntype: "organization"\n---\n\n# Attention Corp\n\nBody.',
+        )
+
+        result = TaxonomySearch(str(tmp_path), kind="entity").search("attention")
+
+        assert [hit.slug for hit in result] == ["attention-corp"]
+        assert result[0].kind == "entity"
+        assert result[0].type == "organization"
+
+    def test_top_k_caps_results(self, tmp_path):
+        for i in range(10):
+            _write(
+                tmp_path,
+                "concepts",
+                f"c{i}.md",
+                f'---\ndescription: "keyword concept {i}"\n---\n\n# C{i}\n\nBody.',
+            )
+
+        result = TaxonomySearch(str(tmp_path)).search("keyword", top_k=3)
+
+        assert len(result) == 3
+
+    def test_empty_taxonomy_returns_no_hits(self, tmp_path):
+        assert TaxonomySearch(str(tmp_path)).search("anything") == []
+
+    def test_default_top_k_is_higher_than_search_wiki(self, tmp_path):
+        for i in range(15):
+            _write(
+                tmp_path,
+                "concepts",
+                f"c{i}.md",
+                f'---\ndescription: "keyword concept {i}"\n---\n\n# C{i}\n\nBody.',
+            )
+
+        result = TaxonomySearch(str(tmp_path)).search("keyword")
+
+        assert len(result) == 15
