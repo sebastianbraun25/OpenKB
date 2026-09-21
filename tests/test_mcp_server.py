@@ -191,17 +191,16 @@ class TestMcpSearchTaxonomy:
         assert isinstance(result, dict)
         assert result["error"] == "result_too_large"
         assert result["size_bytes"] > MAX_RESULT_BYTES
-        assert result["num_pages"] > 1
+        assert "top_k" in result["message"]
 
-    def test_page_returns_a_fixed_slice_under_budget(self, tmp_path, monkeypatch):
+    def test_smaller_top_k_stays_under_budget(self, tmp_path, monkeypatch):
         _make_kb_with_many_concepts(tmp_path, count=50)
         monkeypatch.chdir(tmp_path)
 
-        result = search_taxonomy("concept", top_k=50, page=1)
+        result = search_taxonomy("concept", top_k=3)
 
         assert isinstance(result, list)
-        assert len(result) > 0
-        assert len(result) < 50
+        assert len(result) == 3
 
 
 class TestMcpSearchWiki:
