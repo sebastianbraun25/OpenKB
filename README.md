@@ -355,8 +355,8 @@ For MCP-capable assistants (or any client that prefers typed tools over filesyst
 No index cache: every tool rebuilds its underlying index fresh on every call, same as the CLI.
 
 **Response size guard:** every listing/search tool's result is capped at ~25 KB (serialized) — `get_content` is exempt, see above. A result over that budget is never silently truncated — instead the tool returns `{"error": "result_too_large", "size_bytes": ..., "max_bytes": ..., "message": "..."}` explaining how to retry:
-- `list_kbs` / `list_taxonomy` / `list_documents` / `search_taxonomy` — splitting a listing by character or line makes no sense, so the item list is instead cut into a fixed number of whole-item pages; the message names the page count, and you call again with `page=1`, `page=2`, ... (the same idea as `get_content`'s `pages` argument, just one page number over the listing instead of a range over a document).
-- `search_wiki` — retry with a lower `top_k` or a narrower `scope`.
+- `list_kbs` / `list_taxonomy` / `list_documents` — splitting a listing by character or line makes no sense, so the item list is instead cut into a fixed number of whole-item pages; the message names the page count, and you call again with `page=1`, `page=2`, ... (the same idea as `get_content`'s `pages` argument, just one page number over the listing instead of a range over a document).
+- `search_wiki` / `search_taxonomy` — retry with a lower `top_k` (and, for `search_wiki`, a narrower `scope`).
 
 Every tool accepts an optional `kb` parameter (a registered KB name/alias, or an absolute KB root path) so one server process can serve multiple knowledge bases — omit it to use the KB resolved from the server's working directory or global default (today's behavior):
 
