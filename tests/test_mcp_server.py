@@ -15,6 +15,7 @@ from openkb.mcp_server import (
     list_documents_tool,
     list_kbs,
     list_taxonomy,
+    search_taxonomy,
     search_wiki,
 )
 
@@ -40,14 +41,14 @@ def _make_kb(tmp_path):
 def _make_kb_with_many_concepts(tmp_path, count: int):
     """Create a KB with *count* concept pages, each carrying a long brief.
 
-    Used to exercise the ~5 KB response-size guard deterministically,
+    Used to exercise the ~25 KB response-size guard deterministically,
     independent of any single fixture's exact byte count.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / ".openkb").mkdir()
     concepts_dir = tmp_path / "wiki" / "concepts"
     concepts_dir.mkdir(parents=True)
-    long_brief = "x" * 200
+    long_brief = "x" * 600
     for i in range(count):
         (concepts_dir / f"concept-{i:03d}.md").write_text(
             f'---\ndescription: "{long_brief}"\n---\n\n# Concept {i}\n\nBody.',
@@ -113,6 +114,94 @@ class TestMcpListTaxonomy:
         with patch("openkb.mcp_server.load_global_config", return_value={}):
             with pytest.raises(ValueError, match="No knowledge base found"):
                 list_taxonomy()
+
+
+class TestMcpSearchTaxonomy:
+    def test_ranks_by_brief_match(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        result = search_taxonomy("attention")
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["slug"] == "attention"
+        assert result[0]["kind"] == "concept"
+        assert result[0]["score"] > 0
+
+    def test_matches_query_against_slug_not_just_brief(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        # "attention" only appears in the slug/title, not in the brief text
+        # ("How attention works" does contain it too, so use a KB where the
+        # brief text is unrelated to the slug to isolate the slug match).
+        (tmp_path / "wiki" / "concepts" / "gradient-descent.md").write_text(
+            '---\ndescription: "An optimization method"\n---\n\n# Gradient Descent\n\nBody.',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = search_taxonomy("gradient descent")
+
+        assert any(h["slug"] == "gradient-descent" for h in result)
+
+    def test_kind_filter(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        (tmp_path / "wiki" / "entities").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "wiki" / "entities" / "attention-corp.md").write_text(
+            '---\ndescription: "A company about attention"\ntype: "organization"\n---\n\n'
+            "# Attention Corp\n\nBody.",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = search_taxonomy("attention", kind="entity")
+
+        assert all(h["kind"] == "entity" for h in result)
+        assert any(h["slug"] == "attention-corp" for h in result)
+
+    def test_never_matches_full_body_text(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        (tmp_path / "wiki" / "concepts" / "unrelated.md").write_text(
+            '---\ndescription: "Something else entirely"\n---\n\n'
+            "# Unrelated\n\nThis body mentions field_xyz deep inside.",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = search_taxonomy("field_xyz")
+
+        assert result == []
+
+    def test_no_matches_returns_empty_list(self, tmp_path, monkeypatch):
+        _make_kb(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        result = search_taxonomy("nonexistent_term_zzz")
+
+        assert result == []
+
+    def test_returns_error_payload_when_over_budget(self, tmp_path, monkeypatch):
+        _make_kb_with_many_concepts(tmp_path, count=50)
+        monkeypatch.chdir(tmp_path)
+
+        result = search_taxonomy("concept", top_k=50)
+
+        assert isinstance(result, dict)
+        assert result["error"] == "result_too_large"
+        assert result["size_bytes"] > MAX_RESULT_BYTES
+        assert result["num_pages"] > 1
+
+    def test_page_returns_a_fixed_slice_under_budget(self, tmp_path, monkeypatch):
+        _make_kb_with_many_concepts(tmp_path, count=50)
+        monkeypatch.chdir(tmp_path)
+
+        result = search_taxonomy("concept", top_k=50, page=1)
+
+        assert isinstance(result, list)
+        assert len(result) > 0
+        assert len(result) < 50
 
 
 class TestMcpSearchWiki:
@@ -369,7 +458,9 @@ class TestResultSizeGuard:
         assert isinstance(result, list)
         assert len(result) == 2
 
-    def test_get_content_returns_error_payload_when_over_budget(self, tmp_path, monkeypatch):
+    def test_get_content_never_size_guarded_returns_full_content(self, tmp_path, monkeypatch):
+        # get_content has no response-size guard - a full page (even a huge
+        # one) is always returned as-is; only `pages` narrows a long source.
         _make_kb(tmp_path)
         huge_body = "y" * (MAX_RESULT_BYTES * 2)
         (tmp_path / "wiki" / "summaries" / "huge.md").write_text(
@@ -379,13 +470,13 @@ class TestResultSizeGuard:
 
         result = get_content_tool("huge", kind="summary")
 
-        assert isinstance(result, dict)
-        assert result["error"] == "result_too_large"
-        assert result["size_bytes"] > MAX_RESULT_BYTES
+        assert isinstance(result, list)
+        assert result[0]["error"] is None
+        assert huge_body in result[0]["content"]
 
     def test_search_wiki_returns_error_payload_when_over_budget(self, tmp_path, monkeypatch):
         _make_kb(tmp_path)
-        for i in range(50):
+        for i in range(200):
             (tmp_path / "wiki" / "summaries" / f"doc{i}.md").write_text(
                 f'---\ndescription: "About field_xyz number {i}"\n---\n\n'
                 f"# Doc {i}\n\nDetails about field_xyz appear here, {'z' * 100}.",
@@ -393,7 +484,7 @@ class TestResultSizeGuard:
             )
         monkeypatch.chdir(tmp_path)
 
-        result = search_wiki("field_xyz", top_k=50)
+        result = search_wiki("field_xyz", top_k=200)
 
         assert isinstance(result, dict)
         assert result["error"] == "result_too_large"

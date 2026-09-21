@@ -11,10 +11,13 @@ improve relative to index-only navigation, never regress.
 
 Concepts and entities are deliberately excluded from full-text search (see
 :class:`TieredWikiSearch` below) — they are found by semantic browsing
-(``list_taxonomy_items``/``get_content`` in ``agent.tools``), not keyword
-search, so :class:`WikiFullTextIndex` (kept for backward compatibility with
-the original single-tier ``search_wiki`` tool) and :class:`TieredWikiSearch`
-cover different, non-overlapping surfaces:
+(``list_taxonomy_items``/``get_content`` in ``agent.tools``), or, for a KB
+with too many taxonomy items to browse whole, by :class:`TaxonomySearch`'s
+narrower BM25 search over just each page's slug + one-line brief (never a
+page's full body — see that class's docstring for why). So
+:class:`WikiFullTextIndex` (kept for backward compatibility with the
+original single-tier ``search_wiki`` tool), :class:`TieredWikiSearch`, and
+:class:`TaxonomySearch` cover different, non-overlapping surfaces:
 
 - :class:`WikiFullTextIndex` — the original combined BM25 index over
   ``concepts/`` + ``entities/`` + ``summaries/`` (:data:`PAGE_CONTENT_DIRS`).
@@ -459,3 +462,84 @@ class TieredWikiSearch:
         if invalid:
             raise ValueError(f"Unknown scope(s) {invalid}; expected any of {TIERED_SCOPES}.")
         return {tier: self._scorers[tier].search(query, top_k=top_k) for tier in tiers}
+
+
+@dataclass(frozen=True)
+class TaxonomyHit:
+    """A single BM25 search result over a concept/entity page.
+
+    Carries the same fields as a :class:`TaxonomyItem` (``agent.content``)
+    plus ``score`` — a search hit is a ranked taxonomy item, not a
+    different shape of thing.
+    """
+
+    kind: Literal["concept", "entity"]
+    slug: str
+    path: str  # wiki-root-relative, e.g. "concepts/attention.md"
+    brief: str
+    score: float
+    type: str | None = None
+
+
+class TaxonomySearch:
+    """BM25 search over concept/entity pages, scoped to slug + one-line brief.
+
+    A separate, narrower surface from :class:`TieredWikiSearch` — never a
+    page's full body — so a query cannot surface a concept/entity purely
+    because of an incidental word buried deep in its page, only because the
+    query matches the same short, scannable text ``list_taxonomy_items``/
+    ``list_taxonomy`` already show (plus the slug itself, hyphens/underscores
+    read as spaces, so a query using the page's own name, e.g. "attention
+    mechanism", matches even when the brief text happens not to repeat that
+    exact wording). Complements that plain browse listing with ranking, for
+    a KB with too many taxonomy items to browse whole.
+    """
+
+    def __init__(self, wiki_root: str | Path, kind: str | None = None) -> None:
+        from openkb.agent.content import list_taxonomy_items
+
+        items = list_taxonomy_items(str(Path(wiki_root).resolve()), kind=kind)
+        self._items = {item.path: item for item in items}
+
+        pages: list[_IndexedPage] = []
+        for item in items:
+            readable_slug = item.slug.replace("-", " ").replace("_", " ")
+            tokens = _tokenize(f"{readable_slug} {item.brief}")
+            if not tokens:
+                continue
+            pages.append(
+                _IndexedPage(path=item.path, title=item.slug, text=item.brief, tokens=tokens)
+            )
+        self._scorer = _BM25Scorer(pages)
+
+    def search(self, query: str, top_k: int = 20) -> list[TaxonomyHit]:
+        """Return the ``top_k`` highest-scoring concept/entity pages for *query*.
+
+        Args:
+            query: Free-text search query (keywords or a question);
+                matched against each page's slug (readable form) + brief.
+            top_k: Maximum number of ranked results to return. Deliberately
+                a much larger default than :meth:`TieredWikiSearch.search`'s
+                ``top_k=5`` — a taxonomy brief is short, so more hits cost
+                little, and this is the primary way to narrow a large
+                taxonomy instead of browsing every page.
+
+        Returns:
+            Ranked hits, highest score first. Empty if the query has no
+            tokens or the KB has no concepts/entities.
+        """
+        hits = self._scorer.search(query, top_k=top_k)
+        results: list[TaxonomyHit] = []
+        for hit in hits:
+            item = self._items[hit.path]
+            results.append(
+                TaxonomyHit(
+                    kind=item.kind,
+                    slug=item.slug,
+                    path=item.path,
+                    brief=item.brief,
+                    score=hit.score,
+                    type=item.type,
+                )
+            )
+        return results

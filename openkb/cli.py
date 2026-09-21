@@ -3081,8 +3081,9 @@ def list_taxonomy_cmd(ctx, kind, as_json):
     """List persisted concept/entity pages with their one-line briefs.
 
     Intended for semantic browsing (external agents/scripts pick a slug by
-    meaning), not keyword search — see ``openkb search`` for that. Never
-    includes not-yet-paged pending candidates, only committed ``.md`` pages.
+    meaning), not keyword search — see ``openkb search-taxonomy``/``openkb
+    search`` for that. Never includes not-yet-paged pending candidates,
+    only committed ``.md`` pages.
     """
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
@@ -3104,6 +3105,61 @@ def list_taxonomy_cmd(ctx, kind, as_json):
         type_suffix = f" ({item.type})" if item.type else ""
         brief_suffix = f" — {item.brief}" if item.brief else ""
         click.echo(f"[{item.kind}] {item.slug}{type_suffix}{brief_suffix}")
+
+
+@cli.command(name="search-taxonomy")
+@click.argument("query")
+@click.option(
+    "--kind",
+    type=click.Choice(["concept", "entity"]),
+    default=None,
+    help="Restrict to concepts or entities (default: both).",
+)
+@click.option("--top-k", default=20, show_default=True, help="Max ranked results to return.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON.")
+@click.pass_context
+@_with_kb_lock(exclusive=False)
+def search_taxonomy_cmd(ctx, query, kind, top_k, as_json):
+    """Rank concept/entity pages by BM25 match against their slug + one-line brief.
+
+    Complements browsing the full concept/entity list (``openkb
+    list-taxonomy``): for a KB with too many taxonomy items to scan by eye,
+    this ranks them by relevance to QUERY instead. Matched only against
+    each page's slug (readable form) and brief, never its full body —
+    unlike ``openkb search``, which covers summaries/sources/explorations
+    but never concepts/entities.
+    """
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.fulltext_index import TaxonomySearch
+
+    hits = TaxonomySearch(str(kb_dir / "wiki"), kind=kind).search(query, top_k=top_k)
+
+    if as_json:
+        payload = [
+            {
+                "kind": h.kind,
+                "slug": h.slug,
+                "path": h.path,
+                "brief": h.brief,
+                "type": h.type,
+                "score": h.score,
+            }
+            for h in hits
+        ]
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if not hits:
+        click.echo("No matching concepts or entities found.")
+        return
+    for hit in hits:
+        type_suffix = f" ({hit.type})" if hit.type else ""
+        brief_suffix = f" — {hit.brief}" if hit.brief else ""
+        click.echo(f"[{hit.kind}] {hit.slug}{type_suffix}{brief_suffix} (score: {hit.score})")
 
 
 @cli.command(name="list-documents")
@@ -3180,9 +3236,10 @@ def _search_results_to_json(results: dict) -> dict:
 def search_cmd(ctx, query, scope, top_k, as_json):
     """Full-text (BM25) search over summaries/sources/explorations, tier by tier.
 
-    Concepts/entities are not covered — use ``openkb list-taxonomy`` for
-    those (semantic browsing, not keyword search). Each tier is scored and
-    ranked independently: ``briefs`` (one-line document summaries), rich
+    Concepts/entities are not covered — use ``openkb list-taxonomy``/
+    ``openkb search-taxonomy`` for those (semantic browsing / brief search,
+    not full-body keyword search). Each tier is scored and ranked
+    independently: ``briefs`` (one-line document summaries), rich
     ``summaries`` (full document-summary text), ``sources`` (raw source
     files, with a page/line locator pointing at the exact hit location),
     and ``explorations`` (saved ``openkb query --save`` answers).

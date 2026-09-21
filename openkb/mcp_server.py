@@ -25,18 +25,25 @@ changes via a separate ``openkb add`` while this process stays alive, so the
 same fresh-per-call rebuild is used deliberately rather than introducing a
 new caching model just for this surface.
 
-Response size guard: every tool below caps its serialized result at
-``MAX_RESULT_BYTES``. A result over budget is never silently truncated —
-that would look like the KB simply doesn't have more — instead the tool
-returns an info payload naming the actual size and how to retry. For the
-``list_*`` tools (``list_kbs``/``list_taxonomy``/``list_documents``), where
-splitting by character or line makes no sense, the full item list is cut
-into fixed-size pages (:func:`_split_into_pages`) and the caller re-requests
-one page at a time via a 1-based ``page`` parameter — the same idea as
-``get_content``'s existing ``pages`` argument for a long source document,
-just a single page number over a *result listing* rather than a range over a
-document's own pre-existing pages. ``get_content``/``search_wiki`` instead
-narrow via their existing ``kind``/``pages``/``top_k``/``scope`` arguments.
+Response size guard: every listing/search tool below caps its serialized
+result at ``MAX_RESULT_BYTES``. A result over budget is never silently
+truncated — that would look like the KB simply doesn't have more — instead
+the tool returns an info payload naming the actual size and how to retry.
+For the ``list_*`` tools and ``search_taxonomy``, where splitting by
+character or line makes no sense, the full item list is cut into
+fixed-size pages (:func:`_split_into_pages`) and the caller re-requests one
+page at a time via a 1-based ``page`` parameter — the same idea as
+``get_content``'s ``pages`` argument for a long source document, just a
+single page number over a *result listing* rather than a range over a
+document's own pre-existing pages. ``search_taxonomy`` additionally exposes
+``top_k`` (how many ranked hits to consider before paging) — narrowing that
+first is usually the more natural knob, since a hit low enough in the
+ranking to fall off a smaller ``top_k`` is unlikely to matter anyway.
+``search_wiki`` narrows only via its ``top_k``/``scope`` arguments (no
+``page``) — its four tiers each need independent top-k control, which a
+single shared page count could not express. ``get_content`` is exempt: it
+always returns a page's full content — the only size control there is its
+existing ``pages`` argument for a long PageIndex source.
 """
 
 from __future__ import annotations
@@ -49,7 +56,7 @@ from mcp.server.fastmcp import FastMCP
 from openkb.agent.content import ContentEntry, get_content, get_kb_status, list_documents
 from openkb.agent.tools import list_taxonomy_items
 from openkb.config import load_global_config, registered_kbs, resolve_kb_alias
-from openkb.fulltext_index import TieredWikiSearch
+from openkb.fulltext_index import TaxonomySearch, TieredWikiSearch
 
 mcp = FastMCP("openkb")
 
@@ -57,7 +64,7 @@ mcp = FastMCP("openkb")
 # tool whose result size scales with wiki content (a taxonomy listing, a
 # multi-tier search, ...) can reach tens of KB for a large KB, so every such
 # tool checks its serialized size against this budget before returning.
-MAX_RESULT_BYTES = 5 * 1024
+MAX_RESULT_BYTES = 25 * 1024
 
 
 def _result_size_bytes(result: object) -> int:
@@ -243,7 +250,7 @@ def list_kbs(page: int | None = None) -> list[dict] | dict:
     Returns:
         One dict per registered KB (``name`` — pass as ``kb=name`` to any
         other tool — and ``path``, its absolute KB root directory), or, if
-        the serialized result would exceed ~5 KB, a
+        the serialized result would exceed ~25 KB, a
         ``{"error": "result_too_large", ...}`` payload naming the page count.
     """
     result = [{"name": name, "path": str(path)} for name, path in registered_kbs()]
@@ -304,7 +311,7 @@ def list_taxonomy(
     Returns:
         One dict per item (``kind``, ``slug``, ``path``, ``brief``, and
         ``type`` — entity type, or ``None`` for concepts), or, if the
-        serialized result would exceed ~5 KB, a
+        serialized result would exceed ~25 KB, a
         ``{"error": "result_too_large", ...}`` payload naming the page count.
     """
     items = list_taxonomy_items(str(_wiki_root(kb)), kind=kind)
@@ -313,6 +320,58 @@ def list_taxonomy(
         for i in items
     ]
     return _paginate_list(result, page, hint="list_taxonomy")
+
+
+@mcp.tool()
+def search_taxonomy(
+    query: str,
+    kind: str | None = None,
+    top_k: int = 20,
+    page: int | None = None,
+    kb: str | None = None,
+) -> list[dict] | dict:
+    """Rank concept/entity pages by BM25 match against their slug + one-line brief.
+
+    Complements ``list_taxonomy``'s plain browse listing: for a KB with too
+    many taxonomy items to scan by eye, this ranks them by relevance to
+    *query* instead. Deliberately narrow — matched only against each page's
+    slug (readable form) and brief, never its full body, unlike
+    ``search_wiki`` over summaries/sources/explorations. A query that only
+    matches text buried in a concept/entity page's body won't surface it
+    here; read the page itself (``get_content``) for that.
+
+    Args:
+        query: Free-text search query (keywords or a natural-language question).
+        kind: Restrict to "concept" or "entity"; omit for both.
+        top_k: Maximum ranked results to return. Deliberately much higher
+            than ``search_wiki``'s ``top_k=5`` default — a brief is short, so
+            more hits cost little, and this is the primary way to narrow a
+            large taxonomy instead of browsing every page via ``list_taxonomy``.
+        page: 1-based page to return if the full ranked result is too large;
+            omit to get everything (or, if too large, a page count to choose
+            from) — same idea as ``list_taxonomy``'s ``page`` parameter.
+        kb: Registered KB name/alias or absolute path; omit to use the KB
+            resolved from the server's cwd or global default.
+
+    Returns:
+        One dict per hit, highest score first (``kind``, ``slug``, ``path``,
+        ``brief``, ``type``, ``score``), or, if the serialized result would
+        exceed ~25 KB, a ``{"error": "result_too_large", ...}`` payload
+        naming the page count.
+    """
+    hits = TaxonomySearch(str(_wiki_root(kb)), kind=kind).search(query, top_k=top_k)
+    result = [
+        {
+            "kind": h.kind,
+            "slug": h.slug,
+            "path": h.path,
+            "brief": h.brief,
+            "type": h.type,
+            "score": h.score,
+        }
+        for h in hits
+    ]
+    return _paginate_list(result, page, hint="search_taxonomy")
 
 
 @mcp.tool(name="list_documents")
@@ -333,7 +392,7 @@ def list_documents_tool(
     Returns:
         One dict per item (``kind``, ``slug``, ``path``, and ``brief`` — an
         exploration's brief is its originally-saved question), or, if the
-        serialized result would exceed ~5 KB, a
+        serialized result would exceed ~25 KB, a
         ``{"error": "result_too_large", ...}`` payload naming the page count.
     """
     items = list_documents(str(_wiki_root(kb)), kind=kind)
@@ -351,7 +410,7 @@ def get_content_tool(
     kind: str | None = None,
     pages: str | None = None,
     kb: str | None = None,
-) -> list[dict] | dict:
+) -> list[dict]:
     """Read wiki content by slug — one tool for every content kind.
 
     Args:
@@ -371,27 +430,12 @@ def get_content_tool(
         ``kind``, ``path``, ``content`` (``None`` on error), and ``error``
         (``None`` on success — e.g. a long PageIndex document without
         ``pages`` set gets an error explaining what to pass instead of
-        content). If the serialized result would exceed ~5 KB, returns a
-        single ``{"error": "result_too_large", ...}`` payload instead,
-        naming the actual size and how to narrow the request (pass an
-        explicit ``kind`` instead of fanning out over all seven, or, for a
-        long PageIndex "source", a smaller ``pages`` range).
+        content). Not subject to the response-size guard — a full page's
+        content is always returned as-is; for a long PageIndex "source",
+        use ``pages`` to fetch a smaller range instead of the whole document.
     """
     entries = get_content(slug, str(_wiki_root(kb)), kind=kind, pages=pages)
-    result = [_content_entry_to_dict(e) for e in entries]
-    size = _result_size_bytes(result)
-    if size <= MAX_RESULT_BYTES:
-        return result
-    hint = (
-        "Pass an explicit `kind` instead of fanning out over all content kinds."
-        if kind is None
-        else "Pass a smaller `pages` range (e.g. a single page) to shrink this source's content."
-        if kind == "source"
-        else "This single entry alone exceeds the limit; there is no smaller kind= to try."
-    )
-    return _oversized_result(
-        size, f"get_content matched {len(entries)} entry/entries for slug={slug!r}. {hint}"
-    )
+    return [_content_entry_to_dict(e) for e in entries]
 
 
 @mcp.tool()
@@ -422,7 +466,7 @@ def search_wiki(
         ``path``, ``title``, ``score``, ``snippet``, and ``locator``
         (``{"kind": "line"|"page", "value": int}`` or ``None``) — a "page"
         locator names the exact PageIndex page to fetch for that document.
-        If the serialized result would exceed ~5 KB, returns a single
+        If the serialized result would exceed ~25 KB, returns a single
         ``{"error": "result_too_large", ...}`` payload instead, naming the
         actual size and a smaller ``top_k``/narrower ``scope`` to retry with.
     """
