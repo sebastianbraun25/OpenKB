@@ -155,6 +155,43 @@ def list_taxonomy(wiki_root: str, kind: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def search_taxonomy(query: str, wiki_root: str, kind: str | None = None, top_k: int = 20) -> str:
+    """Agent-facing text ranking of concept/entity pages by BM25 relevance.
+
+    Complements ``list_taxonomy``'s plain browse listing: for a KB with too
+    many taxonomy items to scan by eye, this ranks them against *query*
+    instead — matched only against each page's slug + one-line brief, never
+    its full body, so a hit here means the same short, scannable text
+    ``list_taxonomy`` already shows actually matches the query, not an
+    incidental word buried deep in the page.
+
+    Args:
+        query: Free-text search query (keywords or a natural-language question).
+        wiki_root: Absolute path to the wiki root directory.
+        kind: Restrict to ``"concept"`` or ``"entity"``; ``None`` ranks both.
+        top_k: Maximum number of ranked results to return. Deliberately much
+            higher than ``search_wiki``'s default — a brief is short, so
+            more hits cost little.
+
+    Returns:
+        One ``- [[path]] (type) — brief (score: N)`` line per hit, ranked
+        highest first, or a message if no hits are found.
+    """
+    from openkb.fulltext_index import TaxonomySearch
+
+    hits = TaxonomySearch(wiki_root, kind=kind).search(query, top_k=top_k)
+    if not hits:
+        return "No matching concepts or entities found."
+
+    lines = []
+    for hit in hits:
+        wikilink = hit.path[:-3] if hit.path.endswith(".md") else hit.path
+        type_suffix = f" ({hit.type})" if hit.type else ""
+        brief_suffix = f" — {hit.brief}" if hit.brief else ""
+        lines.append(f"- [[{wikilink}]]{type_suffix}{brief_suffix} (score: {hit.score})")
+    return "\n".join(lines)
+
+
 def search_wiki(query: str, wiki_root: str, scope: list[str] | None = None, top_k: int = 5) -> str:
     """Tiered full-text (BM25) search over summaries/sources wiki pages.
 

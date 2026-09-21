@@ -16,6 +16,7 @@ from openkb.agent.tools import (
     parse_pages,
     read_wiki_file,
     read_wiki_image,
+    search_taxonomy,
     search_wiki,
     write_wiki_file,
 )
@@ -550,6 +551,60 @@ class TestListTaxonomy:
         result = list_taxonomy(str(tmp_path))
 
         assert result == "No concepts or entities found."
+
+
+# ---------------------------------------------------------------------------
+# search_taxonomy (agent-facing text formatter over TaxonomySearch)
+# ---------------------------------------------------------------------------
+
+
+class TestSearchTaxonomy:
+    def test_ranks_matching_concept_first(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "attention.md").write_text(
+            '---\ndescription: "Mechanism for weighting input relevance"\n---\n\n# Attention\n\nBody.'
+        )
+        (tmp_path / "concepts" / "unrelated.md").write_text(
+            '---\ndescription: "Something else entirely"\n---\n\n# Unrelated\n\nBody.'
+        )
+
+        result = search_taxonomy("attention", wiki_root)
+
+        assert "[[concepts/attention]]" in result
+        assert "unrelated" not in result
+
+    def test_kind_filter(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "attention.md").write_text(
+            '---\ndescription: "Attention mechanism"\n---\n\n# Attention\n\nBody.'
+        )
+        (tmp_path / "entities").mkdir()
+        (tmp_path / "entities" / "attention-corp.md").write_text(
+            '---\ntype: organization\ndescription: "Attention Corp"\n---\n\n# Attention Corp\n\nBody.'
+        )
+
+        result = search_taxonomy("attention", wiki_root, kind="concept")
+
+        assert "concepts/attention" in result
+        assert "entities/attention-corp" not in result
+
+    def test_no_match_returns_message(self, tmp_path):
+        wiki_root = str(tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "attention.md").write_text(
+            '---\ndescription: "Attention mechanism"\n---\n\n# Attention\n\nBody.'
+        )
+
+        result = search_taxonomy("nonexistent_term_zzz", wiki_root)
+
+        assert result == "No matching concepts or entities found."
+
+    def test_empty_taxonomy_returns_message(self, tmp_path):
+        result = search_taxonomy("anything", str(tmp_path))
+
+        assert result == "No matching concepts or entities found."
 
 
 # ---------------------------------------------------------------------------

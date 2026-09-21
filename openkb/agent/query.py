@@ -21,6 +21,9 @@ from openkb.agent.tools import (
     list_taxonomy as list_taxonomy_impl,
 )
 from openkb.agent.tools import (
+    search_taxonomy as search_taxonomy_impl,
+)
+from openkb.agent.tools import (
     search_wiki as search_wiki_impl,
 )
 from openkb.config import LlmCredentialBundle, resolve_model_settings
@@ -41,10 +44,13 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
    `full_text` frontmatter field to the source (see step 5).
 3. For concepts (cross-document synthesis) and entities ("who/what is X"
    questions about a specific named person, organization, place, or
-   product), call list_taxonomy first — it's a compact, one-line-per-item
-   browse list, not a keyword search. Pick the slug(s) that match the
-   question's meaning by their brief, then read_file the matching
-   concepts/<slug>.md or entities/<slug>.md.
+   product): call list_taxonomy first for a small KB — it's a compact,
+   one-line-per-item browse list, not a keyword search. For a KB with too
+   many concepts/entities to scan by eye (list_taxonomy's output gets
+   unwieldy), call search_taxonomy(query) instead — it ranks the same
+   slug+brief text by BM25 relevance so you don't have to read every line.
+   Either way, pick the slug(s) that match the question's meaning, then
+   read_file the matching concepts/<slug>.md or entities/<slug>.md.
 4. For "what documents/explorations exist" questions, or to check whether a
    question was already answered before, call list_documents — same
    browse-list style as list_taxonomy, but over summaries (one per
@@ -131,6 +137,22 @@ def build_query_agent(
         return list_taxonomy_impl(wiki_root, kind=kind)
 
     @function_tool
+    def search_taxonomy(query: str, kind: str | None = None) -> str:
+        """Rank concept/entity pages by BM25 relevance (large-KB alternative to list_taxonomy).
+
+        Use instead of list_taxonomy when the taxonomy has too many
+        concepts/entities to scan by eye. Matched only against each page's
+        slug + one-line brief, never its full body — same scope as
+        list_taxonomy, just ranked instead of listed. Follow up with
+        read_file on the matching concepts/<slug>.md or entities/<slug>.md.
+
+        Args:
+            query: Free-text search query (keywords or a natural-language question).
+            kind: "concept" or "entity" to restrict the ranking; omit for both.
+        """
+        return search_taxonomy_impl(query, wiki_root, kind=kind)
+
+    @function_tool
     def list_documents(kind: str | None = None) -> str:
         """List persisted summary/exploration pages with one-line briefs.
 
@@ -206,7 +228,15 @@ def build_query_agent(
     return Agent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, list_taxonomy, list_documents, search_wiki, get_image],
+        tools=[
+            read_file,
+            get_page_content,
+            list_taxonomy,
+            search_taxonomy,
+            list_documents,
+            search_wiki,
+            get_image,
+        ],
         model=f"litellm/{model}",
         model_settings=ModelSettings(**model_settings),
     )
