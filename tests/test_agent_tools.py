@@ -563,7 +563,7 @@ class TestSearchTaxonomy:
         wiki_root = str(tmp_path)
         (tmp_path / "concepts").mkdir()
         (tmp_path / "concepts" / "attention.md").write_text(
-            '---\ndescription: "Mechanism for weighting input relevance"\n---\n\n# Attention\n\nBody.'
+            '---\ndescription: "Mechanism for weighting relevance"\n---\n\n# Attention\n\nBody.'
         )
         (tmp_path / "concepts" / "unrelated.md").write_text(
             '---\ndescription: "Something else entirely"\n---\n\n# Unrelated\n\nBody.'
@@ -582,7 +582,7 @@ class TestSearchTaxonomy:
         )
         (tmp_path / "entities").mkdir()
         (tmp_path / "entities" / "attention-corp.md").write_text(
-            '---\ntype: organization\ndescription: "Attention Corp"\n---\n\n# Attention Corp\n\nBody.'
+            '---\ntype: organization\ndescription: "Attention Corp"\n---\n\n# A. Corp\n\nBody.'
         )
 
         result = search_taxonomy("attention", wiki_root, kind="concept")
